@@ -484,12 +484,17 @@ if (typeof module !== 'undefined' && module.exports) module.exports = BowlingSco
 </script>
 <script id="physics">
 /* ==========================================================================
-   Física 2D (vista cenital) de la pista, la bola y los pinos.
-   Unidades: metros, segundos, kilogramos. Eje x = lateral (+ derecha del
-   jugador), eje y = a lo largo de la pista (0 en la línea de falta, + hacia
-   los pinos). No depende del DOM: se usa igual en el juego y en pruebas Node.
-   Dimensiones reales (USBC): pista 41,5 in de ancho, 60 ft hasta el pino 1,
-   canales de 9,25 in, pinos separados 12 in de centro a centro.
+   Física 3D de cuerpos rígidos para bowling (sin librerías).
+   Ejes: x lateral (+ derecha del jugador), y arriba, z a lo largo de la pista
+   (0 en la línea de falta, + hacia los bolos). Unidades SI.
+   - La bola es una esfera que patina, gancha y rueda por fricción de Coulomb
+     con el aceite (zona delantera) y la madera seca (zona final).
+   - Cada bolo es un cuerpo rígido con orientación (cuaternión) aproximado por
+     esferas apiladas que siguen el perfil USBC, y un anillo de apoyo en la
+     base para que se mantenga en pie con estabilidad.
+   - Resolución de contactos por impulsos secuenciales con término de rotación,
+     fricción, restitución, corrección de posición (Baumgarte) y reposo.
+   No depende del DOM: se usa igual en el juego y en las pruebas Node.
    ========================================================================== */
 const BowlingPhysics = (function () {
   'use strict';
@@ -497,76 +502,116 @@ const BowlingPhysics = (function () {
   const IN = 0.0254;
   const LANE = {
     width: 41.5 * IN,              // 1,054 m
-    gutter: 9.25 * IN,             // 0,235 m
-    headPinY: 60 * 12 * IN,        // 18,288 m desde la línea de falta
-    pinSpacing: 12 * IN,           // 0,305 m
-    rowSpacing: 12 * IN * Math.sqrt(3) / 2, // 0,264 m
-    arrowsY: 15 * 12 * IN,         // flechas a 15 ft
-    dotsY: 7 * 12 * IN,            // puntos a 7 ft
+    gutter: 9.25 * IN,             // 0,235 m de ancho
+    gutterDepth: 1.875 * IN,       // 0,048 m de profundidad en el centro
+    headPinZ: 60 * 12 * IN,        // 18,288 m
+    pinSpacing: 12 * IN,
+    rowSpacing: 12 * IN * Math.sqrt(3) / 2,
+    arrowsZ: 15 * 12 * IN,
+    dotsZ: 7 * 12 * IN,
     boards: 39,
-    approach: 4.57,                // zona de aproximación tras la línea de falta
+    approach: 4.572,
+    oilLength: 42 * 12 * IN,       // patrón de aceite de 42 ft
+    kickbackHeight: 0.61,
+    pitDepth: 0.33,                // profundidad del foso bajo la pista
+    pitLength: 0.9,                // hasta el cojín del fondo
   };
   LANE.halfWidth = LANE.width / 2;
-  LANE.kickbackX = LANE.halfWidth + LANE.gutter;      // paredes laterales del foso
-  LANE.deckStartY = LANE.headPinY - 0.9;              // inicio de la zona de pinos
-  LANE.pitY = LANE.headPinY + 34.1875 * IN;            // borde del foso (62 ft 10 3/16 in desde la línea de falta)
-  LANE.endY = LANE.pitY + 0.9;                        // fondo del foso (pared)
+  LANE.kickbackX = LANE.halfWidth + LANE.gutter;            // 0,762 m
+  LANE.deckStartZ = LANE.headPinZ - 0.9;                     // zona de bolos: canales planos
+  LANE.pitZ = LANE.headPinZ + 34.1875 * IN;                  // borde del foso: 19,156 m
+  LANE.endZ = LANE.pitZ + LANE.pitLength;
+  LANE.gutterCenterX = LANE.halfWidth + LANE.gutter / 2;
+  LANE.gutterRadius = 0.165;                                 // canal como arco de tubo
+  LANE.gutterAxisY = LANE.gutterRadius - LANE.gutterDepth;   // eje del tubo
+  LANE.flatGutterDepth = 0.09;                               // canales planos junto a la zona de bolos (9 cm bajo la plataforma)
 
-  const BALL = { radius: 8.5 * IN / 2, mass: 6.8 };    // 0,108 m, 15 lb
-  const PIN = { radius: 4.75 * IN / 2, mass: 1.55, height: 15 * IN }; // 0,060 m, 3 lb 6 oz, 0,38 m
+  const BALL = { radius: 8.5 * IN / 2, mass: 6.8 };           // 0,108 m, 15 lb
+  BALL.inertia = 0.4 * BALL.mass * BALL.radius * BALL.radius;
 
-  /* Parámetros de simulación (ajustados con pruebas Monte Carlo). */
-  const SIM = {
-    dt: 1 / 240,                 // paso fijo
-    ballDecel: 0.42,             // m/s² en la zona aceitada (pierde ~1 m/s en 60 ft, como una bola real)
-    ballDecelDry: 0.7,           // en la zona seca final
-    ballDecelDeck: 1.2,          // en la zona de pinos
-    hookReserve: 0.7,            // m/s: velocidad lateral máxima que puede ganar por el gancho (fase de rodadura)
-    pinFriction: 4.5,            // deceleración de un pino que desliza en pie
-    fallenFriction: 2.2,         // deceleración de un pino caído
-    restBallPin: 0.3,
-    restPinPin: 0.35,
-    restWall: 0.35,              // bola contra las paredes laterales
-    restWallPin: 0.62,           // pinos contra las paredes: rebotes vivos («mensajeros»)
-    frictionBallPin: 0.15,       // coeficiente tangencial
-    frictionPinPin: 0.35,
-    fallImpact: 0.65,            // m/s de impacto normal para derribar un pino
-    wobbleImpact: 0.25,          // por encima de esto (y por debajo de fallImpact) el pino tiembla pero sigue en pie
-    fallDisplacement: 0.09,      // m de desplazamiento desde su sitio para caer
-    hookAccel: 0.9,              // m/s² lateral con efecto máximo en la zona seca
-    hookOilZone: 0.68,           // fracción de la pista con aceite (poco gancho)
-    hookOilFactor: 0.1,
-    minSpeed: 4.5,
-    maxSpeed: 9.6,
-    maxAngle: 3 * Math.PI / 180, // ángulo máximo de salida
-    stopSpeed: 0.03,
-    pinWobble: 0.012,            // pequeño azar al caer (m/s)
-    sweepExtra: 0.09,            // radio extra de un pino mientras cae (su cuerpo al volcar barre más área)
-    sweepDur: 0.3,               // duración (s) de ese barrido
-    releaseJitter: 0.14 * Math.PI / 180, // variación humana del ángulo de salida (±4,5 cm en los bolos)
-    xJitter: 0.01,               // y de la posición de salida (m)
-    hookSpeedRef: 8,             // el gancho se normaliza a esta velocidad para que no dependa de la potencia
-    riskSpeed: 9.0,              // a partir de esta velocidad el tiro pierde precisión...
-    riskAngle: 0.2 * Math.PI / 180, // ...hasta ±0,2° de ángulo
-    riskOffset: 0.025,           // ...y ±2,5 cm de posición a máxima potencia
-    speedJitter: 0.015,          // y de la velocidad (fracción)
-    driveRate: 4,                // "empuje": la bola que rueda recupera su dirección tras chocar (1/s)
-    rollAdapt: 1.5,              // velocidad a la que la dirección de rodadura se adapta tras los choques (1/s)
+  /* Bolo USBC: 0,381 m de alto, 1,55 kg, centro de masas a 0,142 m de la base. */
+  const PIN = {
+    height: 15 * IN, mass: 1.55, comHeight: 0.145,           // centro de masas a 5,7 in de la base
+    baseRadius: 2.031 * IN / 2,                              // 0,0258 m
+    beltRadius: 4.766 * IN / 2,                              // 0,0605 m
+    // Esferas (altura desde la base, radio) que aproximan el perfil USBC
+    spheres: [[0.035, 0.034], [0.075, 0.052], [0.114, 0.0605], [0.16, 0.055], [0.205, 0.045], [0.245, 0.031], [0.272, 0.0235], [0.305, 0.028], [0.34, 0.0323]],
+    inertia: [0.0127, 0.0019, 0.0127],                       // en el cuerpo (eje del bolo = y), integrado del perfil
+    rimPoints: 4, rimRadius: 0.004,
   };
 
-  /** Posiciones de los 10 pinos (numeración oficial, 7 a la izquierda). */
-  function rackPositions() {
-    const s = LANE.pinSpacing, h = LANE.rowSpacing, y0 = LANE.headPinY;
+  const SIM = {
+    dt: 1 / 480,
+    iterations: 8,
+    gravity: 9.81,
+    slop: 0.0008,
+    baumgarte: 0.25,
+    maxBias: 3.0,                  // m/s: tope de la velocidad de separación por corrección de posición
+    restThreshold: 0.35,           // m/s: por debajo no hay rebote
+    // Fricción / restitución por pareja
+    muOil: 0.015, muDry: 0.13, muDeck: 0.2, muGutter: 0.12,
+    ballRollRes: 0.12,             // m/s² de resistencia a la rodadura en aceite (más en seco)
+    muPinLane: 0.2, muPinPin: 0.3, muBallPin: 0.05, muPinWall: 0.3,
+    ePinLane: 0.2, ePinPin: 0.2, eBallPin: 0.3, ePinWall: 0.5, eBallWall: 0.3, eBallLane: 0.08, ePit: 0.25,
+    // Sueño y despertar
+    sleepLin: 0.08, sleepAng: 0.6, sleepTime: 0.4, wakeSpeed: 0.04,
+    pinRollDamp: 2.0, pinLinDamp: 1.0, // resistencia a la rodadura de un bolo tumbado
+    // Lanzamiento
+    minSpeed: 4.5, maxSpeed: 9.6, maxAngle: 3 * Math.PI / 180,
+    revRate: 36,                   // rad/s de giro inicial (≈345 rpm)
+    axisRotation: 30 * Math.PI / 180, // rotación del eje con efecto máximo (lado del giro)
+    pitDone: 0.8,                  // s en el foso tras los que la bola se da por terminada
+    releaseJitter: 0.14 * Math.PI / 180, xJitter: 0.01, speedJitter: 0.015,
+    riskSpeed: 9.0, riskAngle: 0.2 * Math.PI / 180, riskOffset: 0.025,
+    settleTime: 0.4, maxTime: 12,
+    standingUp: 0.9,               // componente y del eje para contar un bolo en pie (inclinación < 26°)
+  };
+
+  // ------------------------------------------------------------ vectores
+  const v3 = (x, y, z) => [x, y, z];
+  const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const scale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const len = (a) => Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+  const norm = (a) => { const l = len(a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+  const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+
+  // Cuaterniones [x, y, z, w]
+  const qIdentity = () => [0, 0, 0, 1];
+  function qMul(a, b) {
     return [
-      { id: 1, x: 0, y: y0 },
-      { id: 2, x: -s / 2, y: y0 + h }, { id: 3, x: s / 2, y: y0 + h },
-      { id: 4, x: -s, y: y0 + 2 * h }, { id: 5, x: 0, y: y0 + 2 * h }, { id: 6, x: s, y: y0 + 2 * h },
-      { id: 7, x: -1.5 * s, y: y0 + 3 * h }, { id: 8, x: -0.5 * s, y: y0 + 3 * h },
-      { id: 9, x: 0.5 * s, y: y0 + 3 * h }, { id: 10, x: 1.5 * s, y: y0 + 3 * h },
+      a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+      a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+      a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+      a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
     ];
   }
+  function qNormalize(q) { const l = Math.hypot(q[0], q[1], q[2], q[3]) || 1; return [q[0] / l, q[1] / l, q[2] / l, q[3] / l]; }
+  function qFromAxisAngle(axis, angle) { const s = Math.sin(angle / 2); return [axis[0] * s, axis[1] * s, axis[2] * s, Math.cos(angle / 2)]; }
+  /** Matriz de rotación 3x3 (fila mayor) de un cuaternión. */
+  function qToMatrix(q) {
+    const [x, y, z, w] = q;
+    return [
+      1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+      2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+      2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
+    ];
+  }
+  const mulMV = (m, v) => [m[0] * v[0] + m[1] * v[1] + m[2] * v[2], m[3] * v[0] + m[4] * v[1] + m[5] * v[2], m[6] * v[0] + m[7] * v[1] + m[8] * v[2]];
+  /** Inercia inversa en el mundo: R · diag(1/I) · Rᵀ */
+  function worldInvInertia(R, invI) {
+    const out = new Array(9);
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) {
+      let s = 0;
+      for (let k = 0; k < 3; k++) s += R[i * 3 + k] * invI[k] * R[j * 3 + k];
+      out[i * 3 + j] = s;
+    }
+    return out;
+  }
 
-  /** Generador pseudoaleatorio determinista (mulberry32) para pruebas reproducibles. */
+  // ------------------------------------------------------------ aleatorio determinista
   function rng(seed) {
     let a = seed >>> 0;
     return function () {
@@ -578,318 +623,500 @@ const BowlingPhysics = (function () {
     };
   }
 
-  function makePin(spot) {
-    return {
-      id: spot.id, x: spot.x, y: spot.y, vx: 0, vy: 0,
-      homeX: spot.x, homeY: spot.y,
-      r: PIN.radius, m: PIN.mass,
-      state: 'standing',          // standing | fallen | pit
-      fallDir: { x: 0, y: 1 },    // dirección en la que quedó tumbado
-      fallT: 0,                   // tiempo desde que cayó (para animar)
-      wobbleT: null,              // tiempo desde el último temblor (sin caer)
-      hits: 0,
-    };
+  /** Posiciones (x, z) de los 10 bolos. */
+  function rackPositions() {
+    const s = LANE.pinSpacing, h = LANE.rowSpacing, z0 = LANE.headPinZ;
+    return [
+      { id: 1, x: 0, z: z0 },
+      { id: 2, x: -s / 2, z: z0 + h }, { id: 3, x: s / 2, z: z0 + h },
+      { id: 4, x: -s, z: z0 + 2 * h }, { id: 5, x: 0, z: z0 + 2 * h }, { id: 6, x: s, z: z0 + 2 * h },
+      { id: 7, x: -1.5 * s, z: z0 + 3 * h }, { id: 8, x: -0.5 * s, z: z0 + 3 * h },
+      { id: 9, x: 0.5 * s, z: z0 + 3 * h }, { id: 10, x: 1.5 * s, z: z0 + 3 * h },
+    ];
   }
 
-  /**
-   * Crea el mundo. `standingIds` permite conservar solo los pinos que quedaron
-   * en pie (segundo tiro); si se omite se colocan los 10.
-   */
+  // ------------------------------------------------------------ cuerpos
+  function makePin(spot) {
+    const pin = {
+      kind: 'pin', id: spot.id,
+      p: [spot.x, PIN.comHeight, spot.z],   // posición del centro de masas
+      q: qIdentity(), v: [0, 0, 0], w: [0, 0, 0],
+      m: PIN.mass, invM: 0, invI: [1 / PIN.inertia[0], 1 / PIN.inertia[1], 1 / PIN.inertia[2]],
+      R: null, invIw: null,
+      state: 'standing',        // standing (estático) | dynamic | asleep | pit
+      awake: false, sleepT: 0, hits: 0, upY: 1,
+      homeX: spot.x, homeZ: spot.z,
+    };
+    updateFrame(pin);
+    return pin;
+  }
+  function updateFrame(b) {
+    b.R = qToMatrix(b.q);
+    b.invIw = b.awake ? worldInvInertia(b.R, b.invI) : [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    b.invM = b.awake ? 1 / b.m : 0;
+    b.upY = b.R[4]; // componente y del eje local y
+  }
+  function wake(pin) {
+    if (pin.state === 'pit' || pin.awake) return;
+    pin.awake = true; pin.sleepT = 0; pin.state = 'dynamic';
+    updateFrame(pin);
+  }
+  function sleepBody(pin) {
+    pin.awake = false; pin.v = [0, 0, 0]; pin.w = [0, 0, 0];
+    pin.state = (pin.upY > SIM.standingUp && onDeck(pin.p)) ? 'standing' : 'asleep';
+    updateFrame(pin);
+  }
+  function onDeck(p) { return Math.abs(p[0]) < LANE.halfWidth + 0.06 && p[2] > LANE.deckStartZ && p[2] < LANE.pitZ && p[1] > -0.05; }
+
+  /** Puntos de colisión del bolo en el mundo: esferas del perfil + anillo de la base. */
+  function pinSpheres(pin) {
+    const out = [];
+    const R = pin.R, p = pin.p;
+    for (const [h, r] of PIN.spheres) {
+      const ly = h - PIN.comHeight;
+      out.push({ c: [p[0] + R[1] * ly, p[1] + R[4] * ly, p[2] + R[7] * ly], r, rim: false });
+    }
+    const ly = -PIN.comHeight + PIN.rimRadius;
+    for (let i = 0; i < PIN.rimPoints; i++) {
+      const a = (i / PIN.rimPoints) * Math.PI * 2 + 0.3;
+      const lx = Math.cos(a) * (PIN.baseRadius - PIN.rimRadius), lz = Math.sin(a) * (PIN.baseRadius - PIN.rimRadius);
+      out.push({ c: [p[0] + R[0] * lx + R[1] * ly + R[2] * lz, p[1] + R[3] * lx + R[4] * ly + R[5] * lz, p[2] + R[6] * lx + R[7] * ly + R[8] * lz], r: PIN.rimRadius, rim: true });
+    }
+    return out;
+  }
+
   function createWorld(seed, standingPins) {
     const random = rng(seed == null ? 1 : seed);
-    const pins = standingPins
-      ? standingPins.map((p) => Object.assign(makePin(p), { x: p.x, y: p.y, homeX: p.x, homeY: p.y }))
-      : rackPositions().map(makePin);
+    const pins = (standingPins || rackPositions()).map((s) => makePin(s));
     return {
-      random,
-      pins,
+      random, pins,
       ball: {
-        x: 0, y: 0, vx: 0, vy: 0, r: BALL.radius, m: BALL.mass,
-        spin: 0, active: false, inGutter: false, inPit: false, stopped: false,
-        traveled: 0, time: 0, deckHit: false, rollDir: { x: 0, y: 1 }, hooked: 0,
+        kind: 'ball', p: [0, BALL.radius, -0.3], q: qIdentity(), v: [0, 0, 0], w: [0, 0, 0],
+        m: BALL.mass, invM: 1 / BALL.mass, invIs: 1 / BALL.inertia, r: BALL.radius,
+        invIw: [1 / BALL.inertia, 0, 0, 0, 1 / BALL.inertia, 0, 0, 0, 1 / BALL.inertia],
+        active: false, inGutter: false, inPit: false, stopped: false, rolling: false,
+        traveled: 0, time: 0, deckHit: false, spin: 0, stopT: 0, gutterZ: null, pitT: 0,
       },
-      time: 0,
-      events: [],   // eventos de colisión del último paso (para audio/efectos)
-      finished: false,
-      settleTime: 0,
+      time: 0, events: [], finished: false, settleT: 0,
+      static: { kind: 'static', invM: 0, v: [0, 0, 0], w: [0, 0, 0], invIw: [0, 0, 0, 0, 0, 0, 0, 0, 0], p: [0, 0, 0] },
     };
   }
 
-  /** Lanza la bola. angle en radianes (+ = hacia la derecha), spin en [-1, 1]. */
+  /** Lanza la bola: x lateral, speed m/s, angle rad (+ derecha), spin [-1, 1] (+ gancha a la derecha). */
   function throwBall(world, opts) {
     const b = world.ball;
     const jitter = opts.exact ? 0 : 1;
     const num = (v, d) => (Number.isFinite(v) ? v : d);
-    const baseSpeed = clamp(num(opts.speed, SIM.minSpeed), SIM.minSpeed, SIM.maxSpeed);
-    // A máxima potencia el tiro es menos preciso (riesgo/recompensa)
-    const over = clamp((baseSpeed - SIM.riskSpeed) / (SIM.maxSpeed - SIM.riskSpeed), 0, 1) * jitter;
-    const speed = baseSpeed * (1 + jitter * (world.random() * 2 - 1) * SIM.speedJitter);
+    const base = clamp(num(opts.speed, SIM.minSpeed), SIM.minSpeed, SIM.maxSpeed);
+    const over = clamp((base - SIM.riskSpeed) / (SIM.maxSpeed - SIM.riskSpeed), 0, 1) * jitter;
+    const speed = base * (1 + jitter * (world.random() * 2 - 1) * SIM.speedJitter);
     const angle = clamp(num(opts.angle, 0), -SIM.maxAngle, SIM.maxAngle)
-      + jitter * (world.random() * 2 - 1) * SIM.releaseJitter
-      + over * (world.random() * 2 - 1) * SIM.riskAngle;
-    b.x = clamp(num(opts.x, 0) + jitter * (world.random() * 2 - 1) * SIM.xJitter + over * (world.random() * 2 - 1) * SIM.riskOffset, -LANE.halfWidth + 0.02, LANE.halfWidth - 0.02);
-    b.y = 0;
-    b.vx = Math.sin(angle) * speed;
-    b.vy = Math.cos(angle) * speed;
-    b.spin = clamp(num(opts.spin, 0), -1, 1);
-    b.active = true; b.inGutter = false; b.inPit = false; b.stopped = false;
-    b.traveled = 0; b.time = 0; b.deckHit = false; b.hooked = 0;
-    b.rollDir = { x: Math.sin(angle), y: Math.cos(angle) };
-    world.finished = false; world.settleTime = 0; world.time = 0;
+      + jitter * (world.random() * 2 - 1) * SIM.releaseJitter + over * (world.random() * 2 - 1) * SIM.riskAngle;
+    const spin = clamp(num(opts.spin, 0), -1, 1);
+    const x = clamp(num(opts.x, 0) + jitter * (world.random() * 2 - 1) * SIM.xJitter + over * (world.random() * 2 - 1) * SIM.riskOffset, -LANE.halfWidth + 0.02, LANE.halfWidth - 0.02);
+    b.p = [x, BALL.radius, 0];
+    b.q = qIdentity();
+    b.v = [Math.sin(angle) * speed, 0, Math.cos(angle) * speed];
+    // Giro inicial: eje casi horizontal; con efecto el eje gira (axis rotation) y la bola patina de lado
+    const rev = SIM.revRate;
+    const theta = spin * SIM.axisRotation;
+    b.w = [rev * Math.cos(theta), 0, -rev * Math.sin(theta)];
+    b.spin = spin;
+    b.active = true; b.inGutter = false; b.inPit = false; b.stopped = false; b.rolling = false;
+    b.traveled = 0; b.time = 0; b.deckHit = false; b.stopT = 0; b.gutterZ = null; b.pitT = 0;
+    world.finished = false; world.settleT = 0; world.time = 0;
   }
 
-  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
-
-  function hookProfile(y) {
-    // Poco gancho en la zona aceitada; mucho más en la zona seca final.
-    const f = y / LANE.headPinY;
-    if (f < SIM.hookOilZone) return SIM.hookOilFactor;
-    const t = clamp((f - SIM.hookOilZone) / (1 - SIM.hookOilZone), 0, 1);
-    return SIM.hookOilFactor + (1 - SIM.hookOilFactor) * Math.sin(t * Math.PI / 2);
+  /** Coeficiente de fricción de la pista según la zona (aceite / seco). */
+  function laneMu(z) {
+    if (z > LANE.deckStartZ) return SIM.muDeck;
+    const t = clamp((z - (LANE.oilLength - 0.75)) / 1.5, 0, 1);
+    const s = t * t * (3 - 2 * t);
+    return SIM.muOil + (SIM.muDry - SIM.muOil) * s;
   }
 
-  function applyFriction(body, decel, dt) {
-    const sp = Math.hypot(body.vx, body.vy);
-    if (sp < 1e-6) return;
-    const ns = Math.max(0, sp - decel * dt);
-    const k = ns / sp;
-    body.vx *= k; body.vy *= k;
+  // ------------------------------------------------------------ contactos
+  /** Crea un contacto entre A y B (normal de A hacia B, punto p, penetración pen). */
+  function makeContact(A, B, p, n, pen, e, mu) {
+    const rA = sub(p, A.p), rB = sub(p, B.p);
+    const rv = sub(add(B.v, cross(B.w, rB)), add(A.v, cross(A.w, rA)));
+    const vn0 = dot(rv, n);
+    // Masa efectiva normal
+    const rAn = cross(rA, n), rBn = cross(rB, n);
+    const kn = A.invM + B.invM + dot(n, add(cross(mulMV(A.invIw, rAn), rA), cross(mulMV(B.invIw, rBn), rB)));
+    // Tangentes
+    let t1 = cross(n, Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0]);
+    t1 = norm(t1);
+    const t2 = cross(n, t1);
+    const kt = (t) => { const rAt = cross(rA, t), rBt = cross(rB, t); return A.invM + B.invM + dot(t, add(cross(mulMV(A.invIw, rAt), rA), cross(mulMV(B.invIw, rBt), rB))); };
+    return { A, B, p, n, pen, rA, rB, e, mu, kn: kn > 1e-9 ? kn : 1e-9, t1, t2, kt1: Math.max(1e-9, kt(t1)), kt2: Math.max(1e-9, kt(t2)), vn0, Pn: 0, Pt1: 0, Pt2: 0 };
   }
-
-  function knockPin(world, pin, dirX, dirY) {
-    if (pin.state !== 'standing') return;
-    pin.state = 'fallen';
-    pin.fallT = 0;
-    const len = Math.hypot(dirX, dirY);
-    if (len > 1e-6) {
-      pin.fallDir = { x: dirX / len, y: dirY / len };
-    } else {
-      const a = world.random() * Math.PI * 2;
-      pin.fallDir = { x: Math.cos(a), y: Math.sin(a) };
+  function applyImpulse(body, P, r) {
+    if (!body.invM) return;
+    body.v = add(body.v, scale(P, body.invM));
+    body.w = add(body.w, mulMV(body.invIw, cross(r, P)));
+  }
+  function solveContact(c, dt) {
+    const { A, B, n, rA, rB } = c;
+    let rv = sub(add(B.v, cross(B.w, rB)), add(A.v, cross(A.w, rA)));
+    const vn = dot(rv, n);
+    const bias = Math.min(SIM.maxBias, (SIM.baumgarte / dt) * Math.max(0, c.pen - SIM.slop));
+    const bounce = c.vn0 < -SIM.restThreshold ? -c.e * c.vn0 : 0;
+    let lambda = (-vn + Math.max(bounce, bias)) / c.kn;
+    const Pn0 = c.Pn;
+    c.Pn = Math.max(0, Pn0 + lambda);
+    lambda = c.Pn - Pn0;
+    if (lambda !== 0) {
+      const P = scale(n, lambda);
+      applyImpulse(A, scale(P, -1), rA);
+      applyImpulse(B, P, rB);
     }
-    // Pequeño azar para que dos tiros idénticos no sean idénticos.
-    pin.vx += (world.random() - 0.5) * 2 * SIM.pinWobble;
-    pin.vy += (world.random() - 0.5) * 2 * SIM.pinWobble;
-    world.events.push({ type: 'fall', id: pin.id, x: pin.x, y: pin.y });
-  }
-
-  /** Resuelve una colisión entre dos discos con impulso, fricción y corrección posicional. */
-  function collide(world, A, B, rest, mu, onImpact) {
-    const dx = B.x - A.x, dy = B.y - A.y;
-    const dist2 = dx * dx + dy * dy;
-    const rad = A.r + B.r;
-    if (dist2 >= rad * rad || dist2 < 1e-12) return;
-    const dist = Math.sqrt(dist2);
-    const nx = dx / dist, ny = dy / dist;
-    const rvx = B.vx - A.vx, rvy = B.vy - A.vy;
-    const vn = rvx * nx + rvy * ny;
-    const invA = 1 / A.m, invB = 1 / B.m, invSum = invA + invB;
-    if (vn < 0) {
-      const j = -(1 + rest) * vn / invSum;
-      A.vx -= j * invA * nx; A.vy -= j * invA * ny;
-      B.vx += j * invB * nx; B.vy += j * invB * ny;
-      // Fricción tangencial (Coulomb)
-      const tx0 = rvx - vn * nx, ty0 = rvy - vn * ny;
-      const tl = Math.hypot(tx0, ty0);
-      if (tl > 1e-6) {
-        const tx = tx0 / tl, ty = ty0 / tl;
-        let jt = -(rvx * tx + rvy * ty) / invSum;
-        const maxJt = mu * j;
-        jt = clamp(jt, -maxJt, maxJt);
-        A.vx -= jt * invA * tx; A.vy -= jt * invA * ty;
-        B.vx += jt * invB * tx; B.vy += jt * invB * ty;
+    // Fricción (dos tangentes), cono de Coulomb sobre el impulso normal acumulado
+    const maxF = c.mu * c.Pn;
+    for (const [t, key, kt] of [[c.t1, 'Pt1', c.kt1], [c.t2, 'Pt2', c.kt2]]) {
+      rv = sub(add(B.v, cross(B.w, rB)), add(A.v, cross(A.w, rA)));
+      let lt = -dot(rv, t) / kt;
+      const old = c[key];
+      c[key] = clamp(old + lt, -maxF, maxF);
+      lt = c[key] - old;
+      if (lt !== 0) {
+        const P = scale(t, lt);
+        applyImpulse(A, scale(P, -1), rA);
+        applyImpulse(B, P, rB);
       }
-      if (onImpact) onImpact(-vn, nx, ny);
     }
-    // Corrección posicional para evitar que se hundan
-    const pen = rad - dist;
-    const slop = 0.0005, percent = 0.8;
-    const corr = Math.max(pen - slop, 0) / invSum * percent;
-    A.x -= corr * invA * nx; A.y -= corr * invA * ny;
-    B.x += corr * invB * nx; B.y += corr * invB * ny;
   }
 
-  /** Avanza la simulación un paso fijo. */
+  /** Contacto esfera–plano (y = planeY) opcional limitado en x. */
+  function spherePlane(world, contacts, body, c, r, planeY, e, mu, nrm) {
+    const n = nrm || [0, 1, 0];
+    const d = (c[1] - planeY) * n[1] + (n[0] ? c[0] * n[0] : 0) + (n[2] ? c[2] * n[2] : 0);
+    const pen = r - d;
+    if (pen <= 0) return null;
+    const p = sub(c, scale(n, r));
+    const ct = makeContact(world.static, body, p, n, pen, e, mu);
+    contacts.push(ct);
+    return ct;
+  }
+  /** Contacto esfera–arista (línea paralela al eje z en (ex, ey)). */
+  function sphereEdgeZ(world, contacts, body, c, r, ex, ey, e, mu) {
+    const dx = c[0] - ex, dy = c[1] - ey;
+    const d = Math.hypot(dx, dy);
+    if (d >= r || d < 1e-9) return null;
+    const n = [dx / d, dy / d, 0];
+    const ct = makeContact(world.static, body, [ex, ey, c[2]], n, r - d, e, mu);
+    contacts.push(ct);
+    return ct;
+  }
+
+  /** Contactos de una esfera (de la bola o de un bolo) con el escenario. */
+  function sphereVsScene(world, contacts, body, c, r, isBall) {
+    const x = c[0], y = c[1], z = c[2];
+    const muLane = isBall ? laneMu(z) : SIM.muPinLane;
+    const eLane = isBall ? SIM.eBallLane : SIM.ePinLane;
+    if (z < LANE.deckStartZ) {
+      // Pista con canales a los lados
+      if (Math.abs(x) <= LANE.halfWidth) {
+        const ct = spherePlane(world, contacts, body, c, r, 0, eLane, muLane);
+        if (ct) body.touch = true;
+      } else {
+        const sgn = Math.sign(x);
+        // Arista de la pista (la bola puede rodar por el borde)
+        sphereEdgeZ(world, contacts, body, c, r, sgn * LANE.halfWidth, 0, eLane, muLane);
+        // Canal: medio tubo
+        const cx = sgn * LANE.gutterCenterX, cy = LANE.gutterAxisY;
+        const dx = x - cx, dy = y - cy;
+        const d = Math.hypot(dx, dy);
+        // Solo la mitad inferior del tubo existe (entre el labio de la pista y el exterior)
+        if (d + r > LANE.gutterRadius && d > 1e-6 && dy < 0 && Math.abs(dx) <= -dy * 1.05) {
+          const n = [-dx / d, -dy / d, 0];                 // hacia el eje del tubo
+          const pen = d + r - LANE.gutterRadius;
+          const p = add(c, scale(n, -r));
+          contacts.push(makeContact(world.static, body, p, n, pen, isBall ? SIM.eBallLane : SIM.ePinLane, SIM.muGutter));
+        }
+        // Pared exterior del canal (bajo el retorno) para no salirse de la pista
+        if (Math.abs(x) + r > LANE.kickbackX) {
+          const n = [-sgn, 0, 0];
+          contacts.push(makeContact(world.static, body, [sgn * LANE.kickbackX, y, z], n, Math.abs(x) + r - LANE.kickbackX, SIM.eBallWall, SIM.muPinWall));
+        }
+      }
+    } else if (z <= LANE.pitZ && y > -0.12) {
+      // Zona de bolos: plataforma plana; a los lados, canales planos más bajos
+      if (Math.abs(x) <= LANE.halfWidth) {
+        const ct = spherePlane(world, contacts, body, c, r, 0, eLane, isBall ? SIM.muDeck : SIM.muPinLane);
+        if (ct) body.touch = true;
+      } else {
+        const sgn = Math.sign(x);
+        const ct = spherePlane(world, contacts, body, c, r, -LANE.flatGutterDepth, eLane, isBall ? SIM.muGutter : SIM.muPinLane);
+        if (ct) body.touch = true;
+        // Arista de la plataforma: lo que está en el canal plano no vuelve a subir
+        sphereEdgeZ(world, contacts, body, c, r, sgn * LANE.halfWidth, 0, eLane, 0.3);
+        if (y < 0 && Math.abs(x) - r < LANE.halfWidth) {
+          contacts.push(makeContact(world.static, body, [sgn * LANE.halfWidth, y, z], [sgn, 0, 0], LANE.halfWidth - (Math.abs(x) - r), eLane, 0.3));
+        }
+      }
+      if (Math.abs(x) + r > LANE.kickbackX && y < LANE.kickbackHeight) {
+        const sgn = Math.sign(x);
+        const n = [-sgn, 0, 0];
+        const ct = makeContact(world.static, body, [sgn * LANE.kickbackX, y, z], n, Math.abs(x) + r - LANE.kickbackX, isBall ? SIM.eBallWall : SIM.ePinWall, SIM.muPinWall);
+        ct.wall = true;
+        contacts.push(ct);
+      }
+    } else {
+      // Foso (también bajo el borde de la pista): suelo hundido, paredes laterales, pared frontal y cojín
+      const ct = spherePlane(world, contacts, body, c, r, -LANE.pitDepth, SIM.ePit, 0.5);
+      if (ct) body.touch = true;
+      if (Math.abs(x) + r > LANE.kickbackX) {
+        const sgn = Math.sign(x);
+        contacts.push(makeContact(world.static, body, [sgn * LANE.kickbackX, y, z], [-sgn, 0, 0], Math.abs(x) + r - LANE.kickbackX, SIM.ePit, 0.4));
+      }
+      if (z + r > LANE.endZ) contacts.push(makeContact(world.static, body, [x, y, LANE.endZ], [0, 0, -1], z + r - LANE.endZ, SIM.ePit, 0.4));
+      const edgeY = Math.abs(x) <= LANE.halfWidth ? 0 : -LANE.flatGutterDepth;   // nivel del borde: plataforma o canal plano
+      if (y < edgeY && z - r < LANE.pitZ) {
+        // Pared frontal del foso (bajo la plataforma)
+        contacts.push(makeContact(world.static, body, [x, y, LANE.pitZ], [0, 0, 1], LANE.pitZ - (z - r), SIM.ePit, 0.3));
+      } else if (z - r < LANE.pitZ) {
+        // Arista del borde del foso (para que los bolos vuelquen al caer)
+        const dz = z - LANE.pitZ, dy = y - edgeY;
+        const d = Math.hypot(dz, dy);
+        if (d < r && d > 1e-9) contacts.push(makeContact(world.static, body, [x, edgeY, LANE.pitZ], [0, dy / d, dz / d], r - d, eLane, 0.3));
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ paso de simulación
   function stepOnce(world, dt) {
     const b = world.ball;
+    const pins = world.pins;
     world.events.length = 0;
     world.time += dt;
+    const g = SIM.gravity;
 
-    // ---------------- Bola ----------------
-    if (b.active && !b.inPit && !b.stopped) {
+    // ---- Integrar velocidades (gravedad) ----
+    if (b.active && !b.stopped) {
+      b.v[1] -= g * dt;
       b.time += dt;
-      const inDeck = b.y > LANE.deckStartY;
-      const prof = hookProfile(b.y);
-      applyFriction(b, inDeck ? SIM.ballDecelDeck : SIM.ballDecel + (SIM.ballDecelDry - SIM.ballDecel) * prof, dt);
-      if (!b.inGutter && !inDeck && b.spin !== 0) {
-        // La bola gancha hasta agotar su "reserva" de deslizamiento; después rueda recta.
-        const reserve = SIM.hookReserve * Math.abs(b.spin);
-        const sp0 = Math.hypot(b.vx, b.vy);
-        const k = Math.min(1, (sp0 / SIM.hookSpeedRef) * (sp0 / SIM.hookSpeedRef));
-        const dv = SIM.hookAccel * b.spin * prof * k * dt;
-        if (b.hooked + Math.abs(dv) <= reserve) { b.vx += dv; b.hooked += Math.abs(dv); }
-      }
-      const sp = Math.hypot(b.vx, b.vy);
-      b.x += b.vx * dt; b.y += b.vy * dt;
-      b.traveled += sp * dt;
+    }
+    for (const p of pins) if (p.awake) { p.v[1] -= g * dt; }
 
-      if (!b.inGutter && Math.abs(b.x) > LANE.halfWidth + b.r * 0.35) {
-        // El canal llega hasta el foso: una bola que se sale (aunque sea junto a los pinos) ya no toca pinos
-        b.inGutter = true;
-        b.vx = 0;
-        world.events.push({ type: 'gutter', x: b.x, y: b.y, late: inDeck });
+    // ---- Detectar contactos ----
+    const contacts = [];
+    if (b.active && !b.stopped) {
+      sphereVsScene(world, contacts, b, b.p, b.r, true);
+    }
+    const sph = new Array(pins.length);
+    for (let i = 0; i < pins.length; i++) {
+      const p = pins[i];
+      p.touch = false;
+      if (!p.awake && p.state === 'pit') continue;
+      const spheres = pinSpheres(p);
+      sph[i] = spheres;
+      if (p.awake) for (const s of spheres) sphereVsScene(world, contacts, p, s.c, s.r, false);
+    }
+    // Bola–bolos
+    if (b.active && !b.stopped) {
+      for (let i = 0; i < pins.length; i++) {
+        const p = pins[i];
+        if (p.state === 'pit') continue;
+        const d2 = (p.p[0] - b.p[0]) ** 2 + (p.p[2] - b.p[2]) ** 2;
+        if (d2 > 0.45 * 0.45) continue;
+        for (const s of sph[i]) {
+          if (s.rim) continue;
+          const d = sub(s.c, b.p);
+          const dist = len(d);
+          const rad = b.r + s.r;
+          if (dist >= rad || dist < 1e-9) continue;
+          const n = scale(d, 1 / dist);
+          if (!p.awake) wake(p);
+          const ct = makeContact(b, p, add(b.p, scale(n, b.r)), n, rad - dist, SIM.eBallPin, SIM.muBallPin);
+          contacts.push(ct);
+          if (ct.vn0 < -0.1) { p.hits++; b.deckHit = true; world.events.push({ type: 'hit', impact: -ct.vn0, id: p.id, x: ct.p[0], z: ct.p[2], ball: true }); }
+        }
       }
-      if (b.inGutter) {
-        b.x = Math.sign(b.x) * (LANE.halfWidth + LANE.gutter / 2);
-        b.vx = 0;
-      }
-      if (b.y - b.r > LANE.pitY) {
-        b.inPit = true;
-        world.events.push({ type: 'pit', x: b.x, y: b.y });
-      } else if (sp < SIM.stopSpeed) {
-        b.stopped = true;
-        world.events.push({ type: 'stopped', x: b.x, y: b.y });
+    }
+    // Bolo–bolo
+    for (let i = 0; i < pins.length; i++) {
+      const A = pins[i];
+      if (A.state === 'pit') continue;
+      for (let j = i + 1; j < pins.length; j++) {
+        const B = pins[j];
+        if (B.state === 'pit') continue;
+        if (!A.awake && !B.awake) continue;
+        const d2 = (A.p[0] - B.p[0]) ** 2 + (A.p[1] - B.p[1]) ** 2 + (A.p[2] - B.p[2]) ** 2;
+        if (d2 > 0.55 * 0.55) continue;
+        for (const sa of sph[i]) {
+          if (sa.rim) continue;
+          for (const sb of sph[j]) {
+            if (sb.rim) continue;
+            const d = sub(sb.c, sa.c);
+            const dist = len(d);
+            const rad = sa.r + sb.r;
+            if (dist >= rad || dist < 1e-9) continue;
+            const n = scale(d, 1 / dist);
+            // Despertar al bolo estático si lo empujan
+            const rv = sub(add(B.v, cross(B.w, sub(sa.c, B.p))), add(A.v, cross(A.w, sub(sa.c, A.p))));
+            if (dot(rv, n) < -SIM.wakeSpeed) { if (!A.awake) wake(A); if (!B.awake) wake(B); }
+            if (!A.awake && !B.awake) continue;
+            const ct = makeContact(A, B, add(sa.c, scale(n, sa.r)), n, rad - dist, SIM.ePinPin, SIM.muPinPin);
+            contacts.push(ct);
+            if (ct.vn0 < -0.25) world.events.push({ type: 'hit', impact: -ct.vn0, id: A.id, x: ct.p[0], z: ct.p[2], ball: false });
+          }
+        }
       }
     }
 
-    // ---------------- Pinos ----------------
-    const pins = world.pins;
-    for (const p of pins) {
-      if (p.state === 'pit') continue;
-      if (p.wobbleT != null) p.wobbleT += dt;
-      if (p.state === 'fallen') {
-        p.fallT += dt;
-        // Al volcar, el cuerpo del pino barre más área que su base: radio de colisión temporalmente mayor
-        const f = p.fallT / SIM.sweepDur;
-        p.r = PIN.radius + (f < 1 ? SIM.sweepExtra * Math.sin(f * Math.PI) : 0);
+    // ---- Resolver ----
+    for (let it = 0; it < SIM.iterations; it++) for (const c of contacts) solveContact(c, dt);
+
+    // ---- Fricción de rodadura / patinaje de la bola con la pista ----
+    if (b.active && !b.stopped) {
+      const onLane = b.p[1] < b.r + 0.004 && b.p[2] < LANE.pitZ;
+      const sp = Math.hypot(b.v[0], b.v[2]);
+      if (onLane && sp > 1e-4) {
+        // Velocidad del punto de contacto: v + w × (-r ŷ)
+        const rc = [0, -b.r, 0];
+        const vc = add(b.v, cross(b.w, rc));
+        const slip = [vc[0], 0, vc[2]];
+        const sl = Math.hypot(slip[0], slip[2]);
+        const mu = b.inGutter ? SIM.muGutter : laneMu(b.p[2]);
+        // El patinaje lo resuelve la fricción de Coulomb del contacto; aquí solo la resistencia a la rodadura
+        b.rolling = sl < 0.03;
+        if (b.rolling) {
+          const res = SIM.ballRollRes + 0.6 * mu;
+          const ns = Math.max(0, sp - res * dt) / sp;
+          b.v[0] *= ns; b.v[2] *= ns;
+          b.w[1] *= 1 - 2 * dt;
+        }
       }
-      applyFriction(p, p.state === 'fallen' ? SIM.fallenFriction : SIM.pinFriction, dt);
-      p.x += p.vx * dt; p.y += p.vy * dt;
-      // Paredes laterales (kickbacks): rebotes vivos que pueden devolver un pino al centro
-      if (p.x < -LANE.kickbackX + p.r) { p.x = -LANE.kickbackX + p.r; if (p.vx < 0) { if (Math.abs(p.vx) > SIM.fallImpact) knockPin(world, p, 1, 0); p.vx = -p.vx * SIM.restWallPin; } }
-      if (p.x > LANE.kickbackX - p.r) { p.x = LANE.kickbackX - p.r; if (p.vx > 0) { if (Math.abs(p.vx) > SIM.fallImpact) knockPin(world, p, -1, 0); p.vx = -p.vx * SIM.restWallPin; } }
-      // Foso: el pino desaparece
-      if (p.y - p.r > LANE.pitY) {
-        if (p.state === 'standing') knockPin(world, p, p.vx, p.vy);
+    }
+
+    // ---- Integrar posiciones ----
+    if (b.active && !b.stopped) {
+      b.p = add(b.p, scale(b.v, dt));
+      b.traveled += Math.hypot(b.v[0], b.v[2]) * dt;
+      const wl = len(b.w);
+      if (wl > 1e-9) b.q = qNormalize(qMul(qFromAxisAngle(scale(b.w, 1 / wl), wl * dt), b.q));
+      // Canal
+      if (!b.inGutter && Math.abs(b.p[0]) > LANE.halfWidth + b.r * 0.4 && b.p[2] < LANE.deckStartZ) {
+        b.inGutter = true; b.gutterZ = b.p[2];
+        world.events.push({ type: 'gutter', x: b.p[0], z: b.p[2] });
+      }
+      if (!b.inPit && b.p[2] > LANE.pitZ + 0.05) { b.inPit = true; world.events.push({ type: 'pit', x: b.p[0], z: b.p[2] }); }
+      const sp = len(b.v);
+      if (!b.inPit && sp < 0.05 && b.p[1] < b.r + 0.01) { b.stopT += dt; if (b.stopT > 0.5) { b.stopped = true; world.events.push({ type: 'stopped', x: b.p[0], z: b.p[2] }); } }
+      else b.stopT = 0;
+      if (b.inPit) { b.pitT += dt; if (b.pitT > SIM.pitDone || (b.p[1] < -LANE.pitDepth + b.r + 0.02 && sp < 0.3)) b.stopped = true; }
+    }
+    for (const p of pins) {
+      if (!p.awake) continue;
+      p.p = add(p.p, scale(p.v, dt));
+      const wl = len(p.w);
+      if (wl > 1e-9) p.q = qNormalize(qMul(qFromAxisAngle(scale(p.w, 1 / wl), wl * dt), p.q));
+      updateFrame(p);
+      // Amortiguación: aire y, si toca el suelo, resistencia a la rodadura
+      p.w = scale(p.w, 1 - (p.touch ? SIM.pinRollDamp : 0.3) * dt);
+      if (p.touch && len(p.v) < 0.4) p.v = scale(p.v, 1 - SIM.pinLinDamp * dt);
+      // Foso
+      if (p.state !== 'pit' && p.p[2] > LANE.pitZ + 0.1 && p.p[1] < -0.12) {
         p.state = 'pit';
-        p.vx = 0; p.vy = 0;
-        world.events.push({ type: 'pit-pin', id: p.id, x: p.x, y: p.y });
+        world.events.push({ type: 'pit-pin', id: p.id, x: p.p[0], z: p.p[2] });
+      }
+      if (p.state === 'pit' && p.p[1] < -LANE.pitDepth + 0.12 && len(p.v) < 0.4) {
+        // Reposa en el foso: dejar de simular
+        p.awake = false; p.v = [0, 0, 0]; p.w = [0, 0, 0]; updateFrame(p);
         continue;
       }
-      // Un pino en pie demasiado desplazado de su sitio cae
-      if (p.state === 'standing') {
-        const dx = p.x - p.homeX, dy = p.y - p.homeY;
-        if (dx * dx + dy * dy > SIM.fallDisplacement * SIM.fallDisplacement) knockPin(world, p, dx, dy);
-      }
+      // Sueño
+      if (len(p.v) < SIM.sleepLin && len(p.w) < SIM.sleepAng) {
+        p.sleepT += dt;
+        if (p.sleepT > SIM.sleepTime) sleepBody(p);
+      } else p.sleepT = 0;
     }
 
-    // ---------------- Colisiones ----------------
-    const iterations = 3;
-    for (let it = 0; it < iterations; it++) {
-      if (b.active && !b.inGutter && !b.inPit) {
-        for (const p of pins) {
-          if (p.state === 'pit') continue;
-          collide(world, b, p, SIM.restBallPin, SIM.frictionBallPin, (impact, nx, ny) => {
-            if (it === 0) {
-              p.hits++;
-              b.deckHit = true;
-              world.events.push({ type: 'hit', impact, id: p.id, x: p.x, y: p.y, ball: true });
-            }
-            if (p.state === 'standing' && impact > SIM.fallImpact) knockPin(world, p, nx, ny);
-            else if (p.state === 'standing' && impact > SIM.wobbleImpact) p.wobbleT = 0;
-          });
-        }
-      }
-      for (let i = 0; i < pins.length; i++) {
-        const A = pins[i];
-        if (A.state === 'pit') continue;
-        for (let j = i + 1; j < pins.length; j++) {
-          const B = pins[j];
-          if (B.state === 'pit') continue;
-          collide(world, A, B, SIM.restPinPin, SIM.frictionPinPin, (impact, nx, ny) => {
-            if (it === 0 && impact > 0.15) world.events.push({ type: 'hit', impact, id: A.id, x: A.x, y: A.y, ball: false });
-            if (impact > SIM.fallImpact) {
-              if (A.state === 'standing') knockPin(world, A, -nx, -ny);
-              if (B.state === 'standing') knockPin(world, B, nx, ny);
-            } else if (impact > SIM.wobbleImpact) {
-              if (A.state === 'standing') A.wobbleT = 0;
-              if (B.state === 'standing') B.wobbleT = 0;
-            }
-          });
-        }
-      }
-    }
-
-    // ---------------- Rodadura de la bola ----------------
-    // Una bola que rueda tiene inercia de giro: la fricción con la pista devuelve
-    // su velocidad hacia la dirección de rodadura, por eso "empuja" a través de
-    // los pinos en vez de desviarse como una bola de billar.
-    if (b.active && !b.inGutter && !b.inPit && !b.stopped) {
-      const sp = Math.hypot(b.vx, b.vy);
-      if (sp > 0.1) {
-        if (!b.deckHit) {
-          b.rollDir.x = b.vx / sp; b.rollDir.y = b.vy / sp;
-        } else {
-          const k = Math.min(1, SIM.driveRate * dt);
-          b.vx += (b.rollDir.x * sp - b.vx) * k;
-          b.vy += (b.rollDir.y * sp - b.vy) * k;
-          const k2 = Math.min(1, SIM.rollAdapt * dt);
-          const sp2 = Math.hypot(b.vx, b.vy) || 1;
-          b.rollDir.x += (b.vx / sp2 - b.rollDir.x) * k2;
-          b.rollDir.y += (b.vy / sp2 - b.rollDir.y) * k2;
-          const n = Math.hypot(b.rollDir.x, b.rollDir.y) || 1;
-          b.rollDir.x /= n; b.rollDir.y /= n;
-        }
-      }
-    }
-
-    // ---------------- ¿Terminó el tiro? ----------------
+    // ---- ¿Terminó? ----
     if (b.active && (b.inPit || b.stopped)) {
       let moving = false;
-      for (const p of pins) {
-        if (p.state !== 'pit' && Math.hypot(p.vx, p.vy) > 0.02) { moving = true; break; }
-      }
-      world.settleTime = moving ? 0 : world.settleTime + dt;
-      if (world.settleTime >= 0.35) world.finished = true;
+      for (const p of pins) if (p.awake && p.state !== 'pit') { moving = true; break; }
+      if (b.inPit && !b.stopped) moving = true;
+      world.settleT = moving ? 0 : world.settleT + dt;
+      if (world.settleT >= SIM.settleTime) world.finished = true;
     }
-    if (b.active && world.time > 14) world.finished = true;   // tope absoluto
-    if (world.finished) for (const p of pins) { p.vx = 0; p.vy = 0; }
+    if (b.active && world.time > SIM.maxTime) world.finished = true;
+    if (world.finished) {
+      for (const p of pins) if (p.awake) { p.awake = false; p.v = [0, 0, 0]; p.w = [0, 0, 0]; if (p.state !== 'pit') sleepBody(p); }
+    }
     return world;
   }
 
-  /** Avanza `seconds` segundos en pasos fijos acumulando eventos. */
-  function step(world, seconds, onEvents) {
-    let remaining = seconds;
-    while (remaining > 0 && !world.finished) {
-      const dt = Math.min(SIM.dt, remaining);
-      stepOnce(world, dt);
+  /** Avanza `seconds` con paso fijo (acumulador): la corrección de posición exige un dt constante. */
+  function step(world, seconds, onEvents, force) {
+    world.accum = (world.accum || 0) + seconds;
+    while (world.accum >= SIM.dt - 1e-9 && (force || !world.finished)) {
+      stepOnce(world, SIM.dt);
+      world.accum -= SIM.dt;
       if (onEvents && world.events.length) onEvents(world.events);
-      remaining -= dt;
     }
+    if (world.finished && !force) world.accum = 0;
     return world;
   }
+  /** Barra del pinsetter: empuja los bolos caídos (o todos) que estén delante de barZ hacia el foso. */
+  function sweepPush(world, barZ, all) {
+    for (const p of world.pins) {
+      if (p.state === 'pit') continue;
+      if (!all && isStanding(p)) continue;
+      if (p.p[2] < barZ + 0.13 && p.p[1] > -0.12) {
+        if (!p.awake) wake(p);
+        p.state = 'dynamic';
+        p.p[2] = barZ + 0.13;
+        p.v[2] = Math.max(p.v[2], 0.4);
+        p.sleepT = 0;
+      }
+    }
+  }
 
-  /** Simula un tiro completo hasta que todo se detiene. */
-  function simulateThrow(opts, seed, standingPins) {
-    const world = createWorld(seed, standingPins);
-    throwBall(world, opts);
-    step(world, 20);
-    return summarize(world);
+  function isStanding(pin) {
+    return pin.state !== 'pit' && pin.upY > SIM.standingUp && onDeck(pin.p);
   }
 
   function summarize(world) {
-    const standing = world.pins.filter((p) => p.state === 'standing');
-    const fallen = world.pins.filter((p) => p.state !== 'standing');
+    const standing = world.pins.filter(isStanding);
     return {
-      knocked: fallen.length,
+      knocked: world.pins.length - standing.length,
       standingIds: standing.map((p) => p.id).sort((a, b) => a - b),
-      standing: standing.map((p) => ({ id: p.id, x: p.x, y: p.y })),
+      standing: standing.map((p) => ({ id: p.id, x: p.p[0], z: p.p[2] })),
       gutter: world.ball.inGutter,
       time: world.time,
     };
   }
 
-  return { LANE, BALL, PIN, SIM, rackPositions, createWorld, throwBall, step, stepOnce, simulateThrow, summarize, hookProfile, rng, clamp };
+  function simulateThrow(opts, seed, standingPins) {
+    const world = createWorld(seed, standingPins);
+    throwBall(world, opts);
+    step(world, SIM.maxTime + 1);
+    return summarize(world);
+  }
+
+  /** Trayectoria prevista de la bola sin bolos (para la guía de puntería). */
+  function predictPath(opts, maxZ) {
+    const world = createWorld(1, []);
+    throwBall(world, Object.assign({}, opts, { exact: true }));
+    const pts = [];
+    const limit = maxZ == null ? LANE.deckStartZ : maxZ;
+    let i = 0;
+    while (!world.finished && world.ball.p[2] < limit && i < 4000) {
+      stepOnce(world, SIM.dt * 2);
+      if (i % 12 === 0) pts.push({ x: world.ball.p[0], z: world.ball.p[2], gutter: world.ball.inGutter });
+      if (world.ball.inGutter) { pts.push({ x: world.ball.p[0], z: world.ball.p[2], gutter: true }); break; }
+      i++;
+    }
+    return pts;
+  }
+
+  return {
+    LANE, BALL, PIN, SIM, rackPositions, createWorld, throwBall, step, stepOnce, simulateThrow, summarize, predictPath, sweepPush,
+    isStanding, laneMu, rng, clamp, pinSpheres,
+    math: { add, sub, scale, dot, cross, len, norm, qMul, qNormalize, qFromAxisAngle, qToMatrix, mulMV },
+  };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = BowlingPhysics;
@@ -1088,6 +1315,1058 @@ const Sound = (function () {
   return { unlock, resumeIfNeeded, setEnabled, isEnabled, pinHit, rollStart, rollUpdate, rollStop, strike, spare, gutter, thud, click, sweep };
 })();
 </script>
+<script id="gl">
+/* ==========================================================================
+   Núcleo WebGL (sin librerías): matrices, shaders, mallas y texturas.
+   ========================================================================== */
+const GLCore = (function () {
+  'use strict';
+
+  // ------------------------------------------------------------ matrices 4x4 (columna mayor, como WebGL)
+  const M4 = {
+    identity() { return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]); },
+    multiply(a, b) {
+      const o = new Float32Array(16);
+      for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+        o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+      }
+      return o;
+    },
+    perspective(fovy, aspect, near, far) {
+      const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+      const o = new Float32Array(16);
+      o[0] = f / aspect; o[5] = f; o[10] = (far + near) * nf; o[11] = -1; o[14] = 2 * far * near * nf;
+      return o;
+    },
+    ortho(l, r, b, t, n, f) {
+      const o = new Float32Array(16);
+      o[0] = 2 / (r - l); o[5] = 2 / (t - b); o[10] = -2 / (f - n);
+      o[12] = -(r + l) / (r - l); o[13] = -(t + b) / (t - b); o[14] = -(f + n) / (f - n); o[15] = 1;
+      return o;
+    },
+    /** Vista para un mundo zurdo (+x derecha, +y arriba, +z hacia delante); requiere gl.frontFace(gl.CW). */
+    lookAt(eye, target, up) {
+      const z = norm3(sub3(eye, target));
+      const x = norm3(cross3(z, up));
+      const y = cross3(x, z);
+      return new Float32Array([
+        x[0], y[0], z[0], 0,
+        x[1], y[1], z[1], 0,
+        x[2], y[2], z[2], 0,
+        -dot3(x, eye), -dot3(y, eye), -dot3(z, eye), 1,
+      ]);
+    },
+    translation(x, y, z) { const o = M4.identity(); o[12] = x; o[13] = y; o[14] = z; return o; },
+    scaling(x, y, z) { const o = M4.identity(); o[0] = x; o[5] = y; o[10] = z; return o; },
+    /** Matriz de modelo a partir de posición y cuaternión [x, y, z, w] (y escala opcional). */
+    fromQuat(p, q, s) {
+      const [x, y, z, w] = q; const sc = s || 1;
+      return new Float32Array([
+        (1 - 2 * (y * y + z * z)) * sc, 2 * (x * y + z * w) * sc, 2 * (x * z - y * w) * sc, 0,
+        2 * (x * y - z * w) * sc, (1 - 2 * (x * x + z * z)) * sc, 2 * (y * z + x * w) * sc, 0,
+        2 * (x * z + y * w) * sc, 2 * (y * z - x * w) * sc, (1 - 2 * (x * x + y * y)) * sc, 0,
+        p[0], p[1], p[2], 1,
+      ]);
+    },
+    invert(m) {
+      const inv = new Float32Array(16);
+      const a = m;
+      inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+      inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+      inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+      inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+      inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+      inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+      inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+      inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+      inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+      inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+      inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+      inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+      inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+      inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+      inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+      inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+      let det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+      if (!det) return M4.identity();
+      det = 1 / det;
+      for (let i = 0; i < 16; i++) inv[i] *= det;
+      return inv;
+    },
+    /** Transforma un punto (x, y, z, 1). */
+    transformPoint(m, p) {
+      const w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15] || 1;
+      return [(m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12]) / w, (m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13]) / w, (m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14]) / w];
+    },
+  };
+  function sub3(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+  function cross3(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+  function dot3(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+  function norm3(a) { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; }
+
+  // ------------------------------------------------------------ shaders
+  function compile(gl, type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh);
+      gl.deleteShader(sh);
+      throw new Error('Shader: ' + log + '\n' + src.split('\n').map((l, i) => (i + 1) + ': ' + l).join('\n'));
+    }
+    return sh;
+  }
+  /** Crea un programa y recoge uniformes y atributos. */
+  function program(gl, vs, fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('Programa: ' + gl.getProgramInfoLog(p));
+    const u = {}, a = {};
+    const nu = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < nu; i++) { const info = gl.getActiveUniform(p, i); u[info.name.replace('[0]', '')] = gl.getUniformLocation(p, info.name); }
+    const na = gl.getProgramParameter(p, gl.ACTIVE_ATTRIBUTES);
+    for (let i = 0; i < na; i++) { const info = gl.getActiveAttrib(p, i); a[info.name] = gl.getAttribLocation(p, info.name); }
+    return { p, u, a };
+  }
+
+  // ------------------------------------------------------------ mallas (posición, normal, uv intercalados)
+  function createMesh(gl, data, indices) {
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, data instanceof Float32Array ? data : new Float32Array(data), gl.STATIC_DRAW);
+    const ibo = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    const big = indices.length > 65535 || Math.max.apply(null, indices.length > 1e5 ? [70000] : indices) > 65535;
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, big ? new Uint32Array(indices) : new Uint16Array(indices), gl.STATIC_DRAW);
+    return { vbo, ibo, count: indices.length, type: big ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, stride: 32 };
+  }
+  function bindMesh(gl, mesh, prog) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vbo);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
+    if (prog.a.aPos != null && prog.a.aPos >= 0) { gl.enableVertexAttribArray(prog.a.aPos); gl.vertexAttribPointer(prog.a.aPos, 3, gl.FLOAT, false, 32, 0); }
+    if (prog.a.aNrm != null && prog.a.aNrm >= 0) { gl.enableVertexAttribArray(prog.a.aNrm); gl.vertexAttribPointer(prog.a.aNrm, 3, gl.FLOAT, false, 32, 12); }
+    if (prog.a.aUv != null && prog.a.aUv >= 0) { gl.enableVertexAttribArray(prog.a.aUv); gl.vertexAttribPointer(prog.a.aUv, 2, gl.FLOAT, false, 32, 24); }
+  }
+  function drawMesh(gl, mesh) { gl.drawElements(gl.TRIANGLES, mesh.count, mesh.type, 0); }
+
+  /** Sólido de revolución alrededor del eje y a partir de un perfil [(y, radio)...]. */
+  function lathe(profile, segments) {
+    const data = [], idx = [];
+    const n = profile.length;
+    // normales del perfil (2D) por diferencias
+    const nrm2 = profile.map((p, i) => {
+      const a = profile[Math.max(0, i - 1)], b = profile[Math.min(n - 1, i + 1)];
+      const dy = b[0] - a[0], dr = b[1] - a[1];
+      const l = Math.hypot(dy, dr) || 1;
+      return [dy / l, -dr / l]; // (radial, axial) → normal apunta hacia fuera
+    });
+    for (let i = 0; i < n; i++) {
+      const [y, r] = profile[i];
+      const v = i / (n - 1);
+      for (let s = 0; s <= segments; s++) {
+        const a = (s / segments) * Math.PI * 2;
+        const c = Math.cos(a), sn = Math.sin(a);
+        data.push(c * r, y, sn * r, c * nrm2[i][0], nrm2[i][1], sn * nrm2[i][0], s / segments, v);
+      }
+    }
+    for (let i = 0; i < n - 1; i++) for (let s = 0; s < segments; s++) {
+      const a = i * (segments + 1) + s, b = a + segments + 1;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+    return { data, idx };
+  }
+  function sphere(radius, wSeg, hSeg) {
+    const data = [], idx = [];
+    for (let y = 0; y <= hSeg; y++) {
+      const v = y / hSeg, phi = v * Math.PI;
+      for (let x = 0; x <= wSeg; x++) {
+        const u = x / wSeg, th = u * Math.PI * 2;
+        const nx = -Math.cos(th) * Math.sin(phi), ny = Math.cos(phi), nz = Math.sin(th) * Math.sin(phi);
+        data.push(nx * radius, ny * radius, nz * radius, nx, ny, nz, 1 - u, 1 - v);
+      }
+    }
+    for (let y = 0; y < hSeg; y++) for (let x = 0; x < wSeg; x++) {
+      const a = y * (wSeg + 1) + x, b = a + wSeg + 1;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+    return { data, idx };
+  }
+  /** Caja alineada con los ejes entre min y max; uv por cara según escala. */
+  function box(min, max, uvScale) {
+    const data = [], idx = [];
+    const s = uvScale || 1;
+    const faces = [
+      [[1, 0, 0], [0, 1, 0], [0, 0, 1]], [[-1, 0, 0], [0, 1, 0], [0, 0, -1]],
+      [[0, 1, 0], [0, 0, 1], [1, 0, 0]], [[0, -1, 0], [0, 0, 1], [-1, 0, 0]],
+      [[0, 0, 1], [0, 1, 0], [-1, 0, 0]], [[0, 0, -1], [0, 1, 0], [1, 0, 0]],
+    ];
+    const c = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+    const h = [(max[0] - min[0]) / 2, (max[1] - min[1]) / 2, (max[2] - min[2]) / 2];
+    for (const [n, up, right] of faces) {
+      const base = data.length / 8;
+      for (const [su, sv] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+        const p = [0, 1, 2].map((k) => c[k] + n[k] * h[k] + right[k] * h[k] * su + up[k] * h[k] * sv);
+        const ext = (v) => Math.abs(v[0]) * h[0] + Math.abs(v[1]) * h[1] + Math.abs(v[2]) * h[2];
+        data.push(p[0], p[1], p[2], n[0], n[1], n[2], (su + 1) / 2 * ext(right) * 2 * s, (sv + 1) / 2 * ext(up) * 2 * s);
+      }
+      idx.push(base, base + 2, base + 1, base, base + 3, base + 2);
+    }
+    return { data, idx };
+  }
+  /** Rejilla plana en el plano y = 0 (x de x0 a x1, z de z0 a z1) con uv = (x, z) escalados. */
+  function plane(x0, x1, z0, z1, segX, segZ, y, uvScale) {
+    const data = [], idx = [];
+    const s = uvScale || 1;
+    for (let j = 0; j <= segZ; j++) for (let i = 0; i <= segX; i++) {
+      const x = x0 + (x1 - x0) * i / segX, z = z0 + (z1 - z0) * j / segZ;
+      data.push(x, y || 0, z, 0, 1, 0, x * s, z * s);
+    }
+    for (let j = 0; j < segZ; j++) for (let i = 0; i < segX; i++) {
+      const a = j * (segX + 1) + i, b = a + segX + 1;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+    return { data, idx };
+  }
+  /** Canal: medio tubo (superficie interior) a lo largo de z. */
+  function trough(cx, cy, radius, z0, z1, segA, segZ, a0, a1) {
+    const data = [], idx = [];
+    for (let j = 0; j <= segZ; j++) for (let i = 0; i <= segA; i++) {
+      const a = a0 + (a1 - a0) * i / segA;
+      const nx = -Math.cos(a), ny = -Math.sin(a);     // normal hacia el eje
+      const x = cx + Math.cos(a) * radius, y = cy + Math.sin(a) * radius, z = z0 + (z1 - z0) * j / segZ;
+      data.push(x, y, z, nx, ny, 0, i / segA, z);
+    }
+    for (let j = 0; j < segZ; j++) for (let i = 0; i < segA; i++) {
+      const a = j * (segA + 1) + i, b = a + segA + 1;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+    return { data, idx };
+  }
+  function merge(parts) {
+    const data = [], idx = [];
+    for (const p of parts) {
+      const off = data.length / 8;
+      for (let i = 0; i < p.data.length; i++) data.push(p.data[i]);
+      for (let i = 0; i < p.idx.length; i++) idx.push(p.idx[i] + off);
+    }
+    return { data, idx };
+  }
+  function transform(part, m) {
+    const d = part.data;
+    for (let i = 0; i < d.length; i += 8) {
+      const p = M4.transformPoint(m, [d[i], d[i + 1], d[i + 2]]);
+      const n = [m[0] * d[i + 3] + m[4] * d[i + 4] + m[8] * d[i + 5], m[1] * d[i + 3] + m[5] * d[i + 4] + m[9] * d[i + 5], m[2] * d[i + 3] + m[6] * d[i + 4] + m[10] * d[i + 5]];
+      const nn = norm3(n);
+      d[i] = p[0]; d[i + 1] = p[1]; d[i + 2] = p[2]; d[i + 3] = nn[0]; d[i + 4] = nn[1]; d[i + 5] = nn[2];
+    }
+    return part;
+  }
+
+  // ------------------------------------------------------------ texturas
+  function texture2D(gl, source, opts) {
+    const o = opts || {};
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    const pot = (n) => (n & (n - 1)) === 0;
+    const canMip = pot(source.width) && pot(source.height);
+    if (canMip && o.mipmap !== false) {
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      const aniso = gl.getExtension('EXT_texture_filter_anisotropic') || gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic');
+      if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+    } else {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    }
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    const wrap = o.repeat && canMip ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+    return t;
+  }
+  /** Framebuffer con textura de color y profundidad (renderbuffer). */
+  function renderTarget(gl, w, h, opts) {
+    const o = opts || {};
+    const fb = gl.createFramebuffer();
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, o.linear === false ? gl.NEAREST : gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, o.linear === false ? gl.NEAREST : gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const depth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    return { fb, tex, depth, w, h, ok };
+  }
+  function resizeTarget(gl, rt, w, h) {
+    if (rt.w === w && rt.h === h) return;
+    rt.w = w; rt.h = h;
+    gl.bindTexture(gl.TEXTURE_2D, rt.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rt.depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
+  // ------------------------------------------------------------ ruido 2D (para texturas procedurales)
+  function makeNoise(seed) {
+    const perm = new Uint8Array(512);
+    let s = seed >>> 0;
+    const r = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+    const p = Array.from({ length: 256 }, (_, i) => i);
+    for (let i = 255; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+    for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+    const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+    const grad = (h, x, y) => { const g = h & 3; return (g === 0 ? x + y : g === 1 ? -x + y : g === 2 ? x - y : -x - y); };
+    function noise2(x, y) {
+      const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+      x -= Math.floor(x); y -= Math.floor(y);
+      const u = fade(x), v = fade(y);
+      const a = perm[X] + Y, b = perm[X + 1] + Y;
+      const n0 = grad(perm[a], x, y), n1 = grad(perm[b], x - 1, y), n2 = grad(perm[a + 1], x, y - 1), n3 = grad(perm[b + 1], x - 1, y - 1);
+      return (n0 + u * (n1 - n0)) * (1 - v) + (n2 + u * (n3 - n2)) * v;
+    }
+    function fbm(x, y, oct) {
+      let f = 0, a = 0.5, s = 0;
+      for (let i = 0; i < (oct || 4); i++) { f += a * noise2(x, y); s += a; x *= 2.03; y *= 2.01; a *= 0.5; }
+      return f / s;
+    }
+    return { noise2, fbm };
+  }
+
+  return { M4, program, createMesh, bindMesh, drawMesh, lathe, sphere, box, plane, trough, merge, transform, texture2D, renderTarget, resizeTarget, makeNoise, vec: { sub3, cross3, dot3, norm3 } };
+})();
+/* ==========================================================================
+   Renderizador WebGL de la pista (iluminación física, sombras, reflejos).
+   Parte A: shaders, materiales procedurales y construcción de la escena.
+   ========================================================================== */
+const BowlingRenderer = (function () {
+  'use strict';
+  const G = GLCore, M4 = G.M4;
+
+  // ------------------------------------------------------------ shaders
+  const VS_MAIN = `
+    attribute vec3 aPos; attribute vec3 aNrm; attribute vec2 aUv;
+    uniform mat4 uModel, uView, uProj, uLightVP;
+    uniform vec4 uClip;                     // plano de recorte (reflejo)
+    varying vec3 vPos; varying vec3 vNrm; varying vec2 vUv; varying vec4 vShadow; varying float vClip;
+    void main() {
+      vec4 wp = uModel * vec4(aPos, 1.0);
+      vPos = wp.xyz;
+      vNrm = normalize(mat3(uModel) * aNrm);
+      vUv = aUv;
+      vShadow = uLightVP * wp;
+      vClip = dot(uClip, wp);
+      gl_Position = uProj * uView * wp;
+    }`;
+
+  // Iluminación: GGX + Schlick + Lambert, luz principal con sombra, luz de relleno, hemisferio.
+  const FS_COMMON = `
+    precision highp float;
+    varying vec3 vPos; varying vec3 vNrm; varying vec2 vUv; varying vec4 vShadow; varying float vClip;
+    uniform vec3 uCamPos;
+    uniform vec3 uLightDir;      // hacia la luz
+    uniform vec3 uLightColor;
+    uniform vec3 uFillDir; uniform vec3 uFillColor;
+    uniform vec3 uSkyColor; uniform vec3 uGroundColor;
+    uniform vec3 uDeckLightPos; uniform vec3 uDeckLightColor;   // foco sobre los bolos (caída inversa al cuadrado)
+    uniform sampler2D uShadowMap; uniform float uShadowTexel; uniform float uShadowOn;
+    uniform float uExposure;
+    const float PI = 3.14159265;
+
+    float unpack(vec4 c) { return dot(c, vec4(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 16581375.0)); }
+    float shadowFactor(vec3 n) {
+      if (uShadowOn < 0.5) return 1.0;
+      vec3 sc = vShadow.xyz / vShadow.w * 0.5 + 0.5;
+      if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0 || sc.z > 1.0) return 1.0;
+      float ndl = max(dot(n, uLightDir), 0.0);
+      float bias = mix(0.004, 0.0012, ndl);
+      float s = 0.0;
+      for (int x = -1; x <= 1; x++) for (int y = -1; y <= 1; y++) {
+        float d = unpack(texture2D(uShadowMap, sc.xy + vec2(float(x), float(y)) * uShadowTexel));
+        s += (sc.z - bias) > d ? 0.0 : 1.0;
+      }
+      return s / 9.0;
+    }
+    float D_GGX(float NoH, float a) { float a2 = a * a; float d = NoH * NoH * (a2 - 1.0) + 1.0; return a2 / (PI * d * d + 1e-6); }
+    float V_Smith(float NoV, float NoL, float a) { float k = a * 0.5; return 1.0 / ((NoV * (1.0 - k) + k) * (NoL * (1.0 - k) + k) + 1e-5); }
+    vec3 F_Schlick(float VoH, vec3 f0) { float f = pow(1.0 - VoH, 5.0); return f0 + (1.0 - f0) * f; }
+
+    vec3 shade(vec3 albedo, float rough, float metal, vec3 n, vec3 p, float ao, float shadow) {
+      vec3 v = normalize(uCamPos - p);
+      float a = max(rough * rough, 0.002);
+      vec3 f0 = mix(vec3(0.04), albedo, metal);
+      vec3 diff = albedo * (1.0 - metal);
+      vec3 col = vec3(0.0);
+      // Luz principal
+      {
+        vec3 l = uLightDir; vec3 h = normalize(l + v);
+        float NoL = max(dot(n, l), 0.0), NoV = max(dot(n, v), 1e-4), NoH = max(dot(n, h), 0.0), VoH = max(dot(v, h), 0.0);
+        vec3 F = F_Schlick(VoH, f0);
+        vec3 spec = D_GGX(NoH, a) * V_Smith(NoV, NoL, a) * F / 4.0;
+        col += (diff / PI * (1.0 - F) + spec) * uLightColor * NoL * shadow;
+      }
+      // Luz de relleno (sin sombra)
+      {
+        vec3 l = uFillDir; vec3 h = normalize(l + v);
+        float NoL = max(dot(n, l), 0.0), NoV = max(dot(n, v), 1e-4), NoH = max(dot(n, h), 0.0), VoH = max(dot(v, h), 0.0);
+        vec3 F = F_Schlick(VoH, f0);
+        vec3 spec = D_GGX(NoH, max(a, 0.08)) * V_Smith(NoV, NoL, max(a, 0.08)) * F / 4.0;
+        col += (diff / PI * (1.0 - F) + spec) * uFillColor * NoL;
+      }
+      // Foco del pin deck (luz puntual)
+      {
+        vec3 dl = uDeckLightPos - p;
+        float dist2 = max(dot(dl, dl), 0.05);
+        vec3 l = dl * inversesqrt(dist2);
+        vec3 h = normalize(l + v);
+        float NoL = max(dot(n, l), 0.0), NoV = max(dot(n, v), 1e-4), NoH = max(dot(n, h), 0.0), VoH = max(dot(v, h), 0.0);
+        vec3 F = F_Schlick(VoH, f0);
+        vec3 spec = D_GGX(NoH, a) * V_Smith(NoV, NoL, a) * F / 4.0;
+        float cone = smoothstep(-0.25, 0.55, -l.y);  // solo ilumina hacia abajo
+        col += (diff / PI * (1.0 - F) + spec) * uDeckLightColor * NoL * cone / dist2;
+      }
+      // Hemisferio (ambiente) con un toque de reflejo difuso
+      float hemi = n.y * 0.5 + 0.5;
+      vec3 amb = mix(uGroundColor, uSkyColor, hemi);
+      float NoV = max(dot(n, v), 1e-4);
+      vec3 Fa = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - NoV, 5.0);
+      col += (diff * amb + Fa * amb * 0.5 * (1.0 - rough)) * ao;
+      return col;
+    }
+    vec3 tonemap(vec3 c) {
+      c *= uExposure;
+      // ACES (Narkowicz)
+      c = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
+      return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
+    }`;
+
+  // Material genérico con textura de albedo opcional (bolo, paredes, etc.)
+  const FS_STD = FS_COMMON + `
+    uniform sampler2D uAlbedoMap; uniform float uUseMap;
+    uniform vec3 uAlbedo; uniform float uRough; uniform float uMetal; uniform vec3 uEmissive; uniform float uAlpha;
+    uniform vec2 uUvScale;
+    void main() {
+      if (vClip < 0.0) discard;
+      vec3 n = normalize(vNrm);
+      if (!gl_FrontFacing) n = -n;
+      vec3 albedo = uAlbedo;
+      float rough = uRough;
+      if (uUseMap > 0.5) { vec4 t = texture2D(uAlbedoMap, vUv * uUvScale); albedo *= pow(t.rgb, vec3(2.2)); rough = mix(rough, 1.0, (1.0 - t.a) * 0.6); }
+      float ao = 1.0;
+      vec3 col = shade(albedo, rough, uMetal, n, vPos, ao, shadowFactor(n)) + uEmissive;
+      gl_FragColor = vec4(tonemap(col), uAlpha);
+    }`;
+
+  // Pista de madera con reflejo planar proyectado y brillo del aceite
+  const FS_LANE = FS_COMMON + `
+    uniform sampler2D uWood; uniform sampler2D uReflection; uniform mat4 uReflVP;
+    uniform float uOilEnd; uniform float uReflStrength; uniform vec2 uWoodScale;
+    uniform float uLaneHalf; uniform float uGutterOn;
+    void main() {
+      if (vClip < 0.0) discard;
+      vec3 n = normalize(vNrm);
+      vec4 w = texture2D(uWood, vUv * uWoodScale);
+      vec3 albedo = pow(w.rgb, vec3(2.2));
+      // Aceite: zona delantera más brillante, final seco y mate
+      float oil = 1.0 - smoothstep(uOilEnd - 1.5, uOilEnd + 0.8, vPos.z);
+      float rough = mix(0.34, 0.1, oil) + (1.0 - w.a) * 0.12;
+      float ao = 1.0;
+      vec3 col = shade(albedo, rough, 0.0, n, vPos, ao, shadowFactor(n));
+      // Reflejo planar (Fresnel) atenuado por la rugosidad
+      vec4 rp = uReflVP * vec4(vPos, 1.0);
+      vec2 ruv = rp.xy / rp.w * 0.5 + 0.5;
+      if (uReflStrength > 0.0 && ruv.x >= 0.0 && ruv.x <= 1.0 && ruv.y >= 0.0 && ruv.y <= 1.0) {
+        vec3 v = normalize(uCamPos - vPos);
+        float NoV = max(dot(n, v), 0.0);
+        float fres = 0.04 + 0.96 * pow(1.0 - NoV, 5.0);
+        // Desenfoque sencillo según rugosidad (4 muestras)
+        vec2 o = vec2(0.004, 0.004) * rough * 6.0;
+        vec3 refl = pow(texture2D(uReflection, ruv).rgb, vec3(2.2)) * 0.4
+          + pow(texture2D(uReflection, ruv + vec2(o.x, 0.0)).rgb, vec3(2.2)) * 0.15 + pow(texture2D(uReflection, ruv - vec2(o.x, 0.0)).rgb, vec3(2.2)) * 0.15
+          + pow(texture2D(uReflection, ruv + vec2(0.0, o.y)).rgb, vec3(2.2)) * 0.15 + pow(texture2D(uReflection, ruv - vec2(0.0, o.y)).rgb, vec3(2.2)) * 0.15;
+        float k = uReflStrength * (0.035 + 0.6 * pow(1.0 - NoV, 4.0)) * (1.0 - rough * 0.85);
+        col = mix(col, refl, clamp(k, 0.0, 0.5));
+      }
+      gl_FragColor = vec4(tonemap(col), 1.0);
+    }`;
+
+  // Bola: textura de resina reactiva con agujeros, muy brillante
+  const FS_BALL = FS_COMMON + `
+    uniform sampler2D uBallMap; uniform float uRough;
+    void main() {
+      if (vClip < 0.0) discard;
+      vec3 n = normalize(vNrm);
+      vec4 t = texture2D(uBallMap, vUv);
+      vec3 albedo = pow(t.rgb, vec3(2.2));
+      float hole = 1.0 - t.a;                 // alfa < 1 = agujero
+      float rough = mix(uRough, 0.9, hole);
+      albedo = mix(albedo, vec3(0.01), hole);
+      vec3 col = shade(albedo, rough, 0.0, n, vPos, 1.0 - hole * 0.6, shadowFactor(n));
+      gl_FragColor = vec4(tonemap(col), 1.0);
+    }`;
+
+  // Profundidad para el mapa de sombras (empaquetada en RGBA)
+  const VS_DEPTH = `
+    attribute vec3 aPos; uniform mat4 uModel, uLightVP; varying float vDepth;
+    void main() { vec4 p = uLightVP * uModel * vec4(aPos, 1.0); vDepth = p.z / p.w * 0.5 + 0.5; gl_Position = p; }`;
+  const FS_DEPTH = `
+    precision highp float; varying float vDepth;
+    void main() {
+      float d = vDepth;
+      vec4 c = vec4(d, fract(d * 255.0), fract(d * 65025.0), fract(d * 16581375.0));
+      c -= c.yzww * vec4(1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0, 0.0);
+      gl_FragColor = c;
+    }`;
+
+  // Pantalla completa: FXAA ligero + viñeta
+  const VS_QUAD = `attribute vec2 aPos; varying vec2 vUv; void main() { vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+  const FS_POST = `
+    precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform vec2 uTexel; uniform float uVignette;
+    void main() {
+      vec3 c = texture2D(uTex, vUv).rgb;
+      // FXAA simplificado (3x3 ponderado por diferencia de luminancia)
+      vec3 n = texture2D(uTex, vUv + vec2(0.0, uTexel.y)).rgb, s = texture2D(uTex, vUv - vec2(0.0, uTexel.y)).rgb;
+      vec3 e = texture2D(uTex, vUv + vec2(uTexel.x, 0.0)).rgb, w = texture2D(uTex, vUv - vec2(uTexel.x, 0.0)).rgb;
+      float lc = dot(c, vec3(0.299, 0.587, 0.114));
+      float ln = dot(n, vec3(0.299, 0.587, 0.114)), ls = dot(s, vec3(0.299, 0.587, 0.114));
+      float le = dot(e, vec3(0.299, 0.587, 0.114)), lw = dot(w, vec3(0.299, 0.587, 0.114));
+      float lmin = min(lc, min(min(ln, ls), min(le, lw))), lmax = max(lc, max(max(ln, ls), max(le, lw)));
+      float range = lmax - lmin;
+      if (range > 0.08) { c = (c * 2.0 + n + s + e + w) / 6.0; }
+      vec2 d = vUv - 0.5;
+      c *= 1.0 - uVignette * dot(d, d) * 1.6;
+      gl_FragColor = vec4(c, 1.0);
+    }`;
+
+  // ------------------------------------------------------------ texturas procedurales
+  /** Madera de la pista: 39 tablas de arce/pino con veta, juntas y variación. RGB = color, A = brillo (1 = liso). */
+  function makeWoodTexture(size, seed) {
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const ctx = c.getContext('2d');
+    const img = ctx.createImageData(size, size);
+    const d = img.data;
+    const noise = G.makeNoise(seed || 7);
+    const boards = 39;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const bx = (x / size) * boards;                 // tabla
+        const bi = Math.floor(bx), fx = bx - bi;
+        // Variación por tabla (arce claro / tono)
+        const tone = 0.9 + 0.16 * noise.noise2(bi * 12.9898 + 0.5, 3.1);
+        const hue = noise.noise2(bi * 3.7 + 1.0, 7.3);
+        // Veta longitudinal (a lo largo de y) con ligera ondulación
+        const grain = noise.fbm(x * 0.09 + bi * 10, y * 0.012 + bi * 5, 3) * 0.5 + 0.5;
+        const fine = noise.noise2(x * 0.6 + bi, y * 0.05) * 0.5 + 0.5;
+        // Arce (#E3C48F) en las cabeceras y zona de bolos, pino más amarillo (#E9CC8E) en el centro: la v va a lo largo de la pista
+        const zf = y / size;                              // 0 = línea de falta, 1 = fondo (la textura se repite cada 3 m; usamos sólo tono)
+        const pine = 0.5 + 0.5 * Math.sin(zf * Math.PI * 2);
+        let r = (227 + 6 * pine) * tone + hue * 10, g = (196 + 8 * pine) * tone + hue * 4, b = (143 - 1 * pine) * tone - hue * 6;
+        const g1 = 0.78 + 0.22 * grain;
+        r *= g1; g *= g1 * (0.98 + 0.04 * fine); b *= g1;
+        // Juntas entre tablas (oscuras) y bordes ligeramente más claros
+        const edge = Math.min(fx, 1 - fx);
+        const joint = edge < 0.035 ? 0.72 : edge < 0.09 ? 0.95 : 1.0;
+        r *= joint; g *= joint; b *= joint;
+        const i = (y * size + x) * 4;
+        d[i] = Math.max(0, Math.min(255, r)); d[i + 1] = Math.max(0, Math.min(255, g)); d[i + 2] = Math.max(0, Math.min(255, b));
+        d[i + 3] = Math.round(255 * (0.75 + 0.25 * fine * (joint < 1 ? 0.5 : 1)));
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    return c;
+  }
+  /** Bola de resina reactiva: vetas de dos colores, perla, y tres agujeros (alfa 0). */
+  function makeBallTexture(size, colors, seed) {
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size / 2;
+    const ctx = c.getContext('2d');
+    const img = ctx.createImageData(c.width, c.height);
+    const d = img.data;
+    const noise = G.makeNoise(seed || 11);
+    const [c1, c2, c3] = colors;
+    for (let y = 0; y < c.height; y++) {
+      for (let x = 0; x < c.width; x++) {
+        const u = x / c.width, v = y / c.height;
+        // Coordenadas esféricas para que la veta no se pellizque en los polos
+        const th = u * Math.PI * 2, ph = v * Math.PI;
+        const px = Math.cos(th) * Math.sin(ph), py = Math.cos(ph), pz = Math.sin(th) * Math.sin(ph);
+        const n1 = noise.fbm(px * 2.2 + 3, py * 2.2 + pz * 1.3, 4);
+        const n2 = noise.fbm(pz * 3.1 - py * 2.0, px * 2.6 + 9, 3);
+        const swirl = Math.sin((n1 * 2.0 + px * 1.5 + py * 0.8) * 3.0 + n2 * 2.5) * 0.5 + 0.5;
+        const t = Math.pow(swirl, 1.4);
+        let r = c1[0] + (c2[0] - c1[0]) * t, g = c1[1] + (c2[1] - c1[1]) * t, b = c1[2] + (c2[2] - c1[2]) * t;
+        const pearl = Math.pow(Math.max(0, noise.noise2(px * 7 + 2, pz * 7 + 1)), 3) * 0.35;
+        r += (c3[0] - r) * pearl; g += (c3[1] - g) * pearl; b += (c3[2] - b) * pearl;
+        const i = (y * c.width + x) * 4;
+        d[i] = r; d[i + 1] = g; d[i + 2] = b; d[i + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    // Agujeros: dos de dedos y pulgar (agarre convencional) alrededor de un punto de la esfera
+    const hole = (u, v, rad) => {
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.beginPath(); ctx.ellipse(u * c.width, v * c.height, rad * c.width, rad * c.width / Math.max(0.35, Math.sin(v * Math.PI)), 0, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    };
+    hole(0.25, 0.42, 0.012); hole(0.29, 0.42, 0.012); hole(0.27, 0.52, 0.016);
+    // Logo grabado sutil
+    ctx.save(); ctx.globalAlpha = 0.25; ctx.fillStyle = '#ffffff'; ctx.font = `bold ${Math.round(size * 0.03)}px system-ui, sans-serif`; ctx.textAlign = 'center';
+    ctx.fillText('STRIKE', c.width * 0.75, c.height * 0.5); ctx.restore();
+    return c;
+  }
+  /** Cara frontal de la unidad de enmascaramiento: panel oscuro con rótulo, neón y número de pista. */
+  function makeMaskTexture(w, h, laneNumber) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#0b1020'); g.addColorStop(0.55, '#141c33'); g.addColorStop(1, '#0a0e1b');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+    // Degradado radial suave (luz del panel)
+    const rg = ctx.createRadialGradient(w * 0.5, h * 0.55, h * 0.1, w * 0.5, h * 0.55, w * 0.6);
+    rg.addColorStop(0, 'rgba(90,110,170,0.35)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = rg; ctx.fillRect(0, 0, w, h);
+    // Tiras de neón con halo
+    const strips = [[0.3, '#ff5a7a'], [0.4, '#38bdf8'], [0.5, '#f5b942']];
+    for (const [y, col] of strips) {
+      const yy = h * y;
+      const halo = ctx.createLinearGradient(0, yy - h * 0.05, 0, yy + h * 0.05);
+      halo.addColorStop(0, 'rgba(0,0,0,0)'); halo.addColorStop(0.5, col + 'aa'); halo.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = halo; ctx.fillRect(w * 0.08, yy - h * 0.05, w * 0.84, h * 0.1);
+      ctx.fillStyle = col; ctx.fillRect(w * 0.08, yy - h * 0.02, w * 0.84, h * 0.04);
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#f5b942'; ctx.font = `800 ${Math.round(h * 0.3)}px system-ui, sans-serif`;
+    ctx.fillText(String(laneNumber), w * 0.5, h * 0.76);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.font = `700 ${Math.round(h * 0.13)}px system-ui, sans-serif`;
+    ctx.fillText('BOWLING', w * 0.5, h * 0.16);
+    return c;
+  }
+
+  // ------------------------------------------------------------ perfil del bolo (USBC, altura y radio en m)
+  const PIN_PROFILE = [
+    [0.000, 0.0000], [0.000, 0.0258], [0.006, 0.0275], [0.020, 0.0330], [0.040, 0.0420], [0.060, 0.0500], [0.080, 0.0560],
+    [0.100, 0.0595], [0.114, 0.0605], [0.130, 0.0600], [0.150, 0.0580], [0.170, 0.0540], [0.190, 0.0485], [0.210, 0.0425],
+    [0.230, 0.0365], [0.250, 0.0305], [0.270, 0.0255], [0.285, 0.0228], [0.300, 0.0240], [0.315, 0.0290], [0.330, 0.0325],
+    [0.345, 0.0330], [0.360, 0.0300], [0.372, 0.0220], [0.379, 0.0110], [0.381, 0.0000],
+  ];
+
+  return { VS_MAIN, FS_STD, FS_LANE, FS_BALL, VS_DEPTH, FS_DEPTH, VS_QUAD, FS_POST, makeWoodTexture, makeBallTexture, makeMaskTexture, PIN_PROFILE, M4, G };
+})();
+/* ==========================================================================
+   Renderizador WebGL, parte B: escena, pasadas (sombra, reflejo, principal,
+   post-proceso), cámara y API pública.
+   ========================================================================== */
+const BowlingRenderer3D = (function () {
+  'use strict';
+  const R = BowlingRenderer, G = GLCore, M4 = G.M4;
+
+  function create(canvas, P) {
+    const LANE = P.LANE, PINC = P.PIN, BALLC = P.BALL;
+    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'high-performance' })
+      || canvas.getContext('webgl', { antialias: false, alpha: false, powerPreference: 'high-performance' });
+    if (!gl) return null;
+    const isGL2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+    if (!isGL2) gl.getExtension('OES_element_index_uint');
+
+    // ---------- programas ----------
+    const progStd = G.program(gl, R.VS_MAIN, R.FS_STD);
+    const progLane = G.program(gl, R.VS_MAIN, R.FS_LANE);
+    const progBall = G.program(gl, R.VS_MAIN, R.FS_BALL);
+    const progDepth = G.program(gl, R.VS_DEPTH, R.FS_DEPTH);
+    const progPost = G.program(gl, R.VS_QUAD, R.FS_POST);
+
+    // ---------- texturas ----------
+    const woodTex = G.texture2D(gl, R.makeWoodTexture(1024, 7), { repeat: true });
+    const ballTex = G.texture2D(gl, R.makeBallTexture(1024, [[40, 24, 120], [150, 40, 170], [240, 200, 255]], 11), { repeat: false });
+    const maskTex = G.texture2D(gl, R.makeMaskTexture(1024, 512, 7), { repeat: false });
+    const approachCanvas = R.makeWoodTexture(512, 3);
+    const approachTex = G.texture2D(gl, approachCanvas, { repeat: true });
+
+    // ---------- geometría estática ----------
+    const hw = LANE.halfWidth, kb = LANE.kickbackX, gw = LANE.gutter;
+    const laneMesh = G.createMesh(gl, ...pack(G.plane(-hw, hw, 0, LANE.pitZ, 2, 40, 0, 1)));
+    const approachMesh = G.createMesh(gl, ...pack(G.plane(-kb - 0.05, kb + 0.05, -LANE.approach, 0, 2, 6, 0, 1)));
+    // Canales: dos medios tubos + bordes exteriores planos hasta la pared
+    const troughs = [];
+    for (const sgn of [-1, 1]) {
+      const cx = sgn * LANE.gutterCenterX;
+      troughs.push(G.trough(cx, LANE.gutterAxisY, LANE.gutterRadius, 0, LANE.deckStartZ, 10, 24, Math.PI * 1.25, Math.PI * 1.75));
+    }
+    const gutterMesh = G.createMesh(gl, ...pack(G.merge(troughs)));
+    // Zona de bolos plana a los lados (canales planos) y plataforma hasta el foso
+    const deckSides = G.merge([
+      G.plane(-kb, -hw, LANE.deckStartZ, LANE.pitZ, 1, 2, 0, 1), G.plane(hw, kb, LANE.deckStartZ, LANE.pitZ, 1, 2, 0, 1),
+      G.plane(-kb, -hw, 0, LANE.deckStartZ, 1, 2, -0.004, 1), G.plane(hw, kb, 0, LANE.deckStartZ, 1, 2, -0.004, 1), // cubre tras los tubos
+    ]);
+    const deckSideMesh = G.createMesh(gl, ...pack(deckSides));
+    // Paredes laterales (kickbacks) y foso
+    const walls = G.merge([
+      G.box([-kb - 0.03, -LANE.pitDepth, LANE.deckStartZ - 0.3], [-kb, LANE.kickbackHeight, LANE.endZ], 1),
+      G.box([kb, -LANE.pitDepth, LANE.deckStartZ - 0.3], [kb + 0.03, LANE.kickbackHeight, LANE.endZ], 1),
+      G.box([-kb, -LANE.pitDepth - 0.02, LANE.pitZ], [kb, -LANE.pitDepth, LANE.endZ + 0.05], 1),      // suelo del foso
+      G.box([-kb, -LANE.pitDepth, LANE.endZ], [kb, LANE.kickbackHeight + 0.4, LANE.endZ + 0.05], 1),   // cojín del fondo
+      G.box([-kb, -LANE.pitDepth, LANE.pitZ - 0.02], [kb, 0, LANE.pitZ], 1),                           // frente del foso
+    ]);
+    const wallMesh = G.createMesh(gl, ...pack(walls));
+    // Unidad de enmascaramiento (panel sobre los bolos) y techo oscuro
+    const maskMesh = G.createMesh(gl, ...pack(G.box([-kb - 0.35, LANE.kickbackHeight + 0.2, LANE.endZ - 0.58], [kb + 0.35, LANE.kickbackHeight + 1.3, LANE.endZ - 0.5], 1)));
+    const maskUv = G.createMesh(gl, ...pack(quadXY(-kb - 0.35, kb + 0.35, LANE.kickbackHeight + 0.2, LANE.kickbackHeight + 1.3, LANE.endZ - 0.585)));
+    const roomMesh = G.createMesh(gl, ...pack(G.merge([
+      G.plane(-8, 8, -LANE.approach - 2, LANE.endZ + 1, 2, 2, -0.006, 0.2),   // suelo general
+      G.box([-8, 4.6, -LANE.approach - 2], [8, 4.65, LANE.endZ + 1], 1),      // techo
+    ])));
+    // Pistas vecinas: pista + canales con el mismo material de madera
+    const neighbour = G.merge([-1, 1].map((sgn) => {
+      const cx = sgn * (2 * kb + 0.5);
+      return G.merge([
+        G.plane(cx - hw, cx + hw, 0, LANE.pitZ, 1, 8, 0, 1),
+        G.plane(cx - kb, cx - hw, 0, LANE.pitZ, 1, 1, -0.03, 1), G.plane(cx + hw, cx + kb, 0, LANE.pitZ, 1, 1, -0.03, 1),
+      ]);
+    }));
+    const neighbourMesh = G.createMesh(gl, ...pack(neighbour));
+    // Luces del techo: tiras emisivas
+    const lights = [];
+    for (let z = -1; z < LANE.endZ; z += 3.0) for (const lx of [-1.9, 1.9]) lights.push(G.box([lx - 0.08, 4.55, z], [lx + 0.08, 4.6, z + 1.4], 1));
+    const lightMesh = G.createMesh(gl, ...pack(G.merge(lights)));
+    // Marcas de la pista: flechas y puntos como geometría plana muy fina
+    const marks = [];
+    const bw = LANE.width / LANE.boards;
+    for (const b of [5, 10, 15, 20, 25, 30, 35]) {
+      const x = (b - 20) * bw, z = LANE.arrowsZ + Math.abs(b - 20) * 0.03;
+      marks.push(tri([x, 0.0012, z + 0.2], [x - 0.018, 0.0012, z], [x + 0.018, 0.0012, z]));
+    }
+    for (const b of [3, 5, 8, 11, 14, 26, 29, 32, 35, 37]) {
+      const x = (b - 20) * bw;
+      marks.push(G.transform(G.sphere(0.012, 8, 4), M4.multiply(M4.translation(x, 0.0, LANE.dotsZ), M4.scaling(1, 0.08, 1))));
+    }
+    const markMesh = G.createMesh(gl, ...pack(G.merge(marks)));
+    const foulMesh = G.createMesh(gl, ...pack(G.box([-hw - gw, 0.0008, -0.01], [hw + gw, 0.0014, 0.01], 1)));
+    // Bolos y bola
+    const pinMesh = G.createMesh(gl, ...pack(G.lathe(R.PIN_PROFILE.map(([y, r]) => [y - PINC.comHeight, r]), 48)));
+    const ballMesh = G.createMesh(gl, ...pack(G.sphere(BALLC.radius, 64, 32)));
+    const quadMesh = fullscreenQuad(gl);
+    // Barra del pinsetter
+    const sweepMesh = G.createMesh(gl, ...pack(G.merge([
+      G.box([-kb + 0.01, 0.015, -0.03], [kb - 0.01, 0.12, 0.03], 1),             // barra
+      G.box([-kb + 0.01, 0.12, -0.012], [kb - 0.01, 0.34, 0.012], 1),            // placa vertical
+    ])));
+
+    // ---------- objetivos de render ----------
+    const SHADOW = (window.innerWidth || 1024) * (Math.min(window.devicePixelRatio || 1, 2)) > 1100 ? 2048 : 1024;
+    const shadowRT = G.renderTarget(gl, SHADOW, SHADOW, { linear: false });
+    let reflRT = G.renderTarget(gl, 512, 512);
+    let sceneRT = G.renderTarget(gl, 16, 16);
+
+    // ---------- estado ----------
+    const cam = { eye: [0, 1.4, -3.2], target: [0, 0.2, 6], fov: 55 * Math.PI / 180, view: null, proj: null, aspect: 1 };
+    const light = {
+      dir: G.vec.norm3([0.22, 1.0, -0.28]), color: [2.6, 2.45, 2.2],            // luminarias del techo (cálidas), sombras casi verticales
+      fill: G.vec.norm3([-0.4, 0.5, 0.75]), fillColor: [0.35, 0.38, 0.45],      // relleno frío desde el fondo
+      sky: [0.16, 0.17, 0.2], ground: [0.1, 0.075, 0.05],
+      deckPos: [0, 1.45, LANE.headPinZ - 0.6], deckColor: [5.5, 5.8, 6.2],      // foco frío sobre el pin deck
+    };
+    let lightVP = M4.identity();
+    const opts = { reflections: true, shadows: true, post: true, pixelRatio: 1 };
+    let W = 1, H = 1;
+
+    function resize(w, h, dpr) {
+      W = Math.max(1, Math.floor(w * dpr)); H = Math.max(1, Math.floor(h * dpr));
+      canvas.width = W; canvas.height = H;
+      G.resizeTarget(gl, sceneRT, W, H);
+      const rw = Math.max(256, Math.min(1024, Math.floor(W / 2))), rh = Math.max(256, Math.min(1024, Math.floor(H / 2)));
+      G.resizeTarget(gl, reflRT, rw, rh);
+      cam.aspect = W / H;
+    }
+
+    // ---------- utilidades de dibujo ----------
+    function setCommon(prog, view, proj, clip) {
+      gl.useProgram(prog.p);
+      gl.uniformMatrix4fv(prog.u.uView, false, view);
+      gl.uniformMatrix4fv(prog.u.uProj, false, proj);
+      gl.uniformMatrix4fv(prog.u.uLightVP, false, lightVP);
+      gl.uniform4fv(prog.u.uClip, clip);
+      gl.uniform3fv(prog.u.uCamPos, cam.eye);
+      gl.uniform3fv(prog.u.uLightDir, light.dir);
+      gl.uniform3fv(prog.u.uLightColor, light.color);
+      gl.uniform3fv(prog.u.uFillDir, light.fill);
+      gl.uniform3fv(prog.u.uFillColor, light.fillColor);
+      gl.uniform3fv(prog.u.uSkyColor, light.sky);
+      gl.uniform3fv(prog.u.uGroundColor, light.ground);
+      gl.uniform3fv(prog.u.uDeckLightPos, light.deckPos);
+      gl.uniform3fv(prog.u.uDeckLightColor, light.deckColor);
+      gl.uniform1f(prog.u.uExposure, 1.0);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, shadowRT.tex);
+      gl.uniform1i(prog.u.uShadowMap, 2);
+      gl.uniform1f(prog.u.uShadowTexel, 1 / SHADOW);
+      gl.uniform1f(prog.u.uShadowOn, opts.shadows ? 1 : 0);
+    }
+    function drawStd(mesh, model, mat) {
+      const p = progStd;
+      gl.uniformMatrix4fv(p.u.uModel, false, model);
+      gl.uniform3fv(p.u.uAlbedo, mat.albedo);
+      gl.uniform1f(p.u.uRough, mat.rough == null ? 0.6 : mat.rough);
+      gl.uniform1f(p.u.uMetal, mat.metal || 0);
+      gl.uniform3fv(p.u.uEmissive, mat.emissive || [0, 0, 0]);
+      gl.uniform1f(p.u.uAlpha, mat.alpha == null ? 1 : mat.alpha);
+      gl.uniform2fv(p.u.uUvScale, mat.uvScale || [1, 1]);
+      if (mat.map) { gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, mat.map); gl.uniform1i(p.u.uAlbedoMap, 0); gl.uniform1f(p.u.uUseMap, 1); }
+      else gl.uniform1f(p.u.uUseMap, 0);
+      G.bindMesh(gl, mesh, p); G.drawMesh(gl, mesh);
+    }
+    const MAT = {
+      pin: { albedo: [0.92, 0.92, 0.9], rough: 0.22 },
+      wall: { albedo: [0.035, 0.037, 0.045], rough: 0.45, metal: 0.1 },
+      pit: { albedo: [0.02, 0.02, 0.025], rough: 0.9 },
+      room: { albedo: [0.03, 0.028, 0.034], rough: 0.98 },
+      ceiling: { albedo: [0.03, 0.035, 0.05], rough: 1 },
+      lights: { albedo: [1, 1, 1], rough: 0.4, emissive: [3.5, 3.3, 2.8] },
+      marks: { albedo: [0.1, 0.07, 0.04], rough: 0.5 },
+      foul: { albedo: [0.02, 0.02, 0.02], rough: 0.6 },
+      gutter: { albedo: [0.07, 0.072, 0.08], rough: 0.3, metal: 0.25 },
+      flat: { albedo: [0.05, 0.05, 0.055], rough: 0.6 },
+      sweep: { albedo: [0.32, 0.33, 0.36], rough: 0.45, metal: 0.6 },
+      neighbour: { albedo: [0.45, 0.33, 0.2], rough: 0.5 },
+    };
+
+    // ---------- pasadas ----------
+    function updateLightMatrix(state) {
+      // Frustum ortográfico que cubre desde la bola hasta el foso
+      const bz = state.ball ? state.ball.p[2] : 0;
+      const z0 = Math.min(bz - 1.0, LANE.deckStartZ - 1.5), z1 = LANE.endZ + 0.3;
+      const cz = (z0 + z1) / 2, half = (z1 - z0) / 2 + 0.5;
+      const center = [0, 0.2, cz];
+      const eye = [center[0] + light.dir[0] * 12, center[1] + light.dir[1] * 12, center[2] + light.dir[2] * 12];
+      const view = M4.lookAt(eye, center, [0, 1, 0]);
+      const proj = M4.ortho(-1.6, 1.6, -half, half, 0.5, 30);
+      lightVP = M4.multiply(proj, view);
+    }
+    function drawCasters(state, forDepth, view, proj, clip) {
+      // Bolos
+      for (const pin of state.pins) {
+        if (pin.state === 'pit' && pin.p[1] < -0.3) continue;
+        const model = M4.fromQuat(pin.p, pin.q);
+        if (forDepth) { gl.uniformMatrix4fv(progDepth.u.uModel, false, model); G.bindMesh(gl, pinMesh, progDepth); G.drawMesh(gl, pinMesh); }
+        else drawPin(model, pin, view, proj, clip);
+      }
+      // Bola
+      if (state.ball && state.ball.visible) {
+        const b = state.ball;
+        const model = M4.fromQuat(b.p, b.q);
+        if (forDepth) { gl.uniformMatrix4fv(progDepth.u.uModel, false, model); G.bindMesh(gl, ballMesh, progDepth); G.drawMesh(gl, ballMesh); }
+        else {
+          setCommon(progBall, view, proj, clip);
+          gl.uniformMatrix4fv(progBall.u.uModel, false, model);
+          gl.uniform1f(progBall.u.uRough, 0.12);
+          gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, ballTex); gl.uniform1i(progBall.u.uBallMap, 0);
+          G.bindMesh(gl, ballMesh, progBall); G.drawMesh(gl, ballMesh);
+        }
+      }
+      if (state.sweep && !forDepth) {
+        setCommon(progStd, view, proj, clip);
+        drawStd(sweepMesh, M4.translation(0, state.sweep.y, state.sweep.z), MAT.sweep);
+      }
+    }
+    function drawPin(model, pin, view, proj, clip) {
+      setCommon(progStd, view, proj, clip);
+      gl.uniformMatrix4fv(progStd.u.uModel, false, model);
+      // Blanco brillante con dos franjas rojas: el shader estándar no tiene franjas, usamos la textura de bolo
+      gl.uniform3fv(progStd.u.uAlbedo, MAT.pin.albedo);
+      gl.uniform1f(progStd.u.uRough, MAT.pin.rough);
+      gl.uniform1f(progStd.u.uMetal, 0);
+      gl.uniform3fv(progStd.u.uEmissive, [0, 0, 0]);
+      gl.uniform1f(progStd.u.uAlpha, pin.alpha == null ? 1 : pin.alpha);
+      gl.uniform2fv(progStd.u.uUvScale, [1, 1]);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, pinTex); gl.uniform1i(progStd.u.uAlbedoMap, 0); gl.uniform1f(progStd.u.uUseMap, 1);
+      G.bindMesh(gl, pinMesh, progStd); G.drawMesh(gl, pinMesh);
+    }
+    // Textura del bolo: blanco con franjas rojas en el cuello (v = altura normalizada)
+    const pinTex = (() => {
+      const c = document.createElement('canvas'); c.width = 64; c.height = 512;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#f7f6f2'; ctx.fillRect(0, 0, 64, 512);
+      const n = R.PIN_PROFILE.length;
+      const bandY = (h) => { // altura → fila de la textura (v crece con el índice del perfil)
+        let idx = 0; for (let i = 0; i < n; i++) if (R.PIN_PROFILE[i][0] <= h) idx = i;
+        return 512 * (idx / (n - 1));
+      };
+      ctx.fillStyle = '#d8232d';
+      for (const [h0, h1] of [[0.262, 0.278], [0.296, 0.312]]) ctx.fillRect(0, bandY(h0), 64, Math.max(3, bandY(h1) - bandY(h0)));
+      // Corona del logo
+      ctx.fillStyle = '#d8232d'; ctx.beginPath(); ctx.arc(32, bandY(0.14), 7, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#f7f6f2'; ctx.beginPath(); ctx.arc(32, bandY(0.14), 4, 0, Math.PI * 2); ctx.fill();
+      return G.texture2D(gl, c, { repeat: false, mipmap: true });
+    })();
+
+    function drawStatic(view, proj, clip, mirrored) {
+      // Pista
+      setCommon(progLane, view, proj, clip);
+      gl.uniformMatrix4fv(progLane.u.uModel, false, M4.identity());
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, woodTex); gl.uniform1i(progLane.u.uWood, 0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, reflRT.tex); gl.uniform1i(progLane.u.uReflection, 1);
+      gl.uniformMatrix4fv(progLane.u.uReflVP, false, reflVP);
+      gl.uniform1f(progLane.u.uOilEnd, LANE.oilLength);
+      gl.uniform1f(progLane.u.uReflStrength, mirrored || !opts.reflections ? 0 : 1);
+      gl.uniform2fv(progLane.u.uWoodScale, [1 / LANE.width, 1 / 3.0]);
+      G.bindMesh(gl, laneMesh, progLane); G.drawMesh(gl, laneMesh);
+      // Aproximación (madera más clara, sin reflejo)
+      gl.uniform1f(progLane.u.uReflStrength, 0);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, approachTex);
+      gl.uniform2fv(progLane.u.uWoodScale, [1 / (LANE.width + 2 * LANE.gutter), 1 / 3.0]);
+      G.bindMesh(gl, approachMesh, progLane); G.drawMesh(gl, approachMesh);
+      // Pistas vecinas (mismo shader, sin reflejo)
+      gl.uniform2fv(progLane.u.uWoodScale, [1 / LANE.width, 1 / 3.0]);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, woodTex);
+      G.bindMesh(gl, neighbourMesh, progLane); G.drawMesh(gl, neighbourMesh);
+      // Resto con el material estándar
+      setCommon(progStd, view, proj, clip);
+      drawStd(gutterMesh, M4.identity(), MAT.gutter);
+      drawStd(deckSideMesh, M4.identity(), MAT.flat);
+      drawStd(wallMesh, M4.identity(), MAT.wall);
+      drawStd(roomMesh, M4.identity(), MAT.room);
+      drawStd(lightMesh, M4.identity(), MAT.lights);
+      drawStd(markMesh, M4.identity(), MAT.marks);
+      drawStd(foulMesh, M4.identity(), MAT.foul);
+      drawStd(maskMesh, M4.identity(), MAT.wall);
+      drawStd(maskUv, M4.identity(), { albedo: [0.55, 0.55, 0.58], rough: 0.7, map: maskTex, emissive: [0.08, 0.08, 0.1] });
+    }
+
+    let reflVP = M4.identity();
+    function render(state) {
+      if (W < 2) return;
+      cam.view = M4.lookAt(cam.eye, cam.target, [0, 1, 0]);
+      cam.proj = M4.perspective(cam.fov, cam.aspect, 0.08, 60);
+      updateLightMatrix(state);
+      const noClip = [0, 0, 0, 1];
+
+      // 1) Mapa de sombras
+      if (opts.shadows) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, shadowRT.fb);
+        gl.viewport(0, 0, SHADOW, SHADOW);
+        gl.clearColor(1, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE); gl.frontFace(gl.CW); gl.cullFace(gl.FRONT);
+        gl.useProgram(progDepth.p);
+        gl.uniformMatrix4fv(progDepth.u.uLightVP, false, lightVP);
+        drawCasters(state, true);
+        gl.cullFace(gl.BACK);
+      }
+      // 2) Reflejo planar (cámara espejada respecto a y = 0)
+      if (opts.reflections) {
+        const eyeM = [cam.eye[0], -cam.eye[1], cam.eye[2]], tgtM = [cam.target[0], -cam.target[1], cam.target[2]];
+        const viewM = M4.lookAt(eyeM, tgtM, [0, -1, 0]);
+        const projM = M4.perspective(cam.fov, reflRT.w / reflRT.h * (cam.aspect / (reflRT.w / reflRT.h)), 0.08, 60);
+        reflVP = M4.multiply(projM, viewM);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, reflRT.fb);
+        gl.viewport(0, 0, reflRT.w, reflRT.h);
+        gl.clearColor(0.02, 0.025, 0.04, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE); gl.frontFace(gl.CCW); gl.cullFace(gl.BACK);
+        const savedEye = cam.eye; cam.eye = eyeM;
+        drawStaticMirror(viewM, projM, [0, 1, 0, -0.002]);
+        drawCasters(state, false, viewM, projM, [0, 1, 0, -0.002]);
+        cam.eye = savedEye;
+      }
+      // 3) Escena principal
+      gl.bindFramebuffer(gl.FRAMEBUFFER, opts.post ? sceneRT.fb : null);
+      gl.viewport(0, 0, W, H);
+      gl.clearColor(0.02, 0.025, 0.04, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE); gl.frontFace(gl.CW); gl.cullFace(gl.BACK);
+      drawStatic(cam.view, cam.proj, noClip, false);
+      drawCasters(state, false, cam.view, cam.proj, noClip);
+      if (state.guide && state.guide.length > 1) drawGuide(state.guide, cam.view, cam.proj);
+      // 4) Post-proceso
+      if (opts.post) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, W, H);
+        gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+        gl.useProgram(progPost.p);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneRT.tex); gl.uniform1i(progPost.u.uTex, 0);
+        gl.uniform2f(progPost.u.uTexel, 1 / W, 1 / H);
+        gl.uniform1f(progPost.u.uVignette, 0.35);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadMesh);
+        gl.enableVertexAttribArray(progPost.a.aPos); gl.vertexAttribPointer(progPost.a.aPos, 2, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+        gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
+      }
+    }
+    function drawStaticMirror(view, proj, clip) {
+      // En el reflejo no dibujamos la pista (es el espejo) ni la aproximación
+      setCommon(progStd, view, proj, clip);
+      drawStd(wallMesh, M4.identity(), MAT.wall);
+      drawStd(roomMesh, M4.identity(), MAT.room);
+      drawStd(lightMesh, M4.identity(), MAT.lights);
+      drawStd(maskMesh, M4.identity(), MAT.wall);
+      drawStd(maskUv, M4.identity(), { albedo: [0.55, 0.55, 0.58], rough: 0.7, map: maskTex, emissive: [0.08, 0.08, 0.1] });
+      drawStd(gutterMesh, M4.identity(), MAT.gutter);
+    }
+    // Guía de puntería: puntos sobre la pista
+    let guideMesh = null;
+    function drawGuide(pts, view, proj) {
+      setCommon(progStd, view, proj, [0, 0, 0, 1]);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+      if (!guideMesh) guideMesh = G.createMesh(gl, ...pack(G.transform(G.sphere(1, 10, 5), M4.scaling(1, 0.15, 1))));
+      const n = pts.length;
+      for (let i = 0; i < n; i += 2) {
+        const p = pts[i];
+        const t = i / n;
+        const col = p.gutter ? [1.0, 0.3, 0.3] : [0.3, 0.8, 1.0];
+        drawStd(guideMesh, M4.multiply(M4.translation(p.x, 0.004, p.z), M4.scaling(0.028, 0.028, 0.028)), { albedo: col, rough: 1, emissive: [col[0] * 0.6, col[1] * 0.6, col[2] * 0.6], alpha: 0.85 * (1 - t * 0.8) });
+      }
+      gl.disable(gl.BLEND); gl.depthMask(true);
+    }
+
+    // ---------- helpers ----------
+    function pack(part) { return [part.data, part.idx]; }
+    function tri(a, b, c) {
+      return { data: [a[0], a[1], a[2], 0, 1, 0, 0, 0, b[0], b[1], b[2], 0, 1, 0, 0, 1, c[0], c[1], c[2], 0, 1, 0, 1, 1], idx: [0, 1, 2] };
+    }
+    function quadXY(x0, x1, y0, y1, z) {
+      return { data: [x0, y0, z, 0, 0, -1, 0, 1, x1, y0, z, 0, 0, -1, 1, 1, x1, y1, z, 0, 0, -1, 1, 0, x0, y1, z, 0, 0, -1, 0, 0], idx: [0, 2, 1, 0, 3, 2] };
+    }
+    function fullscreenQuad(gl) {
+      const b = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]), gl.STATIC_DRAW);
+      return b;
+    }
+
+    return {
+      gl, cam, light, opts, resize, render,
+      /** Convierte un punto de pantalla (px CSS) en la coordenada x sobre el suelo (y = 0) para colocar la bola. */
+      groundFromScreen(sx, sy, cssW, cssH) {
+        const nx = (sx / cssW) * 2 - 1, ny = 1 - (sy / cssH) * 2;
+        const inv = M4.invert(M4.multiply(cam.proj, cam.view));
+        const p0 = M4.transformPoint(inv, [nx, ny, -1]), p1 = M4.transformPoint(inv, [nx, ny, 1]);
+        const d = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        if (Math.abs(d[1]) < 1e-6) return null;
+        const t = -p0[1] / d[1];
+        if (t < 0) return null;
+        return { x: p0[0] + d[0] * t, z: p0[2] + d[2] * t };
+      },
+      /** Proyecta un punto del mundo a píxeles CSS. */
+      project(p, cssW, cssH) {
+        const vp = M4.multiply(cam.proj, cam.view);
+        const c = M4.transformPoint(vp, p);
+        return { x: (c[0] * 0.5 + 0.5) * cssW, y: (1 - (c[1] * 0.5 + 0.5)) * cssH, visible: c[2] > -1 && c[2] < 1 };
+      },
+    };
+  }
+  return { create };
+})();
+</script>
 <script id="main">
 /* ==========================================================================
    Juego: cámara, render, entrada, flujo de la partida y marcador.
@@ -1097,6 +2376,7 @@ const Sound = (function () {
   const S = BowlingScoring;
   const P = BowlingPhysics;
   const LANE = P.LANE, SIM = P.SIM, BALL = P.BALL, PIN = P.PIN;
+  const RACK = Object.fromEntries(P.rackPositions().map((q) => [q.id, q]));
 
   // ------------------------------------------------------------ utilidades
   const $ = (id) => document.getElementById(id);
@@ -1111,7 +2391,6 @@ const Sound = (function () {
   const reducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 
   const canvas = $('game');
-  const ctx = canvas.getContext('2d');
   const stage = $('stage');
   const el = {
     status: $('status'), pinsChip: $('pins-chip'), hint: $('hint'),
@@ -1132,42 +2411,17 @@ const Sound = (function () {
     W = Math.max(1, Math.round(r.width));
     H = Math.max(1, Math.round(r.height));
     DPR = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.round(W * DPR);
-    canvas.height = Math.round(H * DPR);
+    if (R3) R3.resize(W, H, DPR);
+    else { canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR); }
+    canvas2d.width = Math.round(W * DPR); canvas2d.height = Math.round(H * DPR);
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    updateCamera();
   }
   if (window.ResizeObserver) new ResizeObserver(resize).observe(stage);
   window.addEventListener('resize', resize);
   window.addEventListener('orientationchange', () => setTimeout(resize, 120));
 
-  // ------------------------------------------------------------ cámara (pseudo-3D)
-  const CAM = { height: 1.35, back: 2.4, maxY: LANE.headPinY - 4.4, pitchPortrait: 24, pitchLandscape: 17 };
-  const cam = { y: -CAM.back, pitch: 0, sin: 0, cos: 1, F: 500, cx: 0, cy: 0, shake: 0, sx: 0, sy: 0, zoom: 1 };
-  function updateCamera() {
-    const aspect = H / Math.max(1, W);
-    const t = clamp((aspect - 0.75) / 0.75, 0, 1);
-    const deg = lerp(CAM.pitchLandscape, CAM.pitchPortrait, t);
-    cam.pitch = deg * Math.PI / 180;
-    cam.sin = Math.sin(cam.pitch); cam.cos = Math.cos(cam.pitch);
-    cam.cx = W / 2;
-    cam.cy = H * 0.5;
-    // El horizonte queda al 9 % de la altura: F = (cy - 0.09 H) / tan(pitch)
-    cam.F = (cam.cy - H * 0.09) / Math.tan(cam.pitch);
-  }
-  function project(x, y, z) {
-    const dy = y - cam.y, dz = (z || 0) - CAM.height;
-    const depth = dy * cam.cos - dz * cam.sin;
-    const up = dy * cam.sin + dz * cam.cos;
-    const s = cam.F / Math.max(depth, 0.05);
-    return { x: cam.cx + x * s + cam.sx, y: cam.cy - up * s + cam.sy, s, depth };
-  }
-  /** Coordenada x del suelo (en la línea de falta) bajo un punto de pantalla. */
-  function groundX(sx, y) {
-    const p = project(0, y, 0);
-    return (sx - cam.cx) / p.s;
-  }
-  const horizonY = () => cam.cy - cam.F * Math.tan(cam.pitch);
+  // ------------------------------------------------------------ cámara: sacudida (la cámara 3D vive en camState, parte B)
+  const cam = { shake: 0, sx: 0, sy: 0 };
 
   // ------------------------------------------------------------ estado del juego
   const game = {
@@ -1214,7 +2468,7 @@ const Sound = (function () {
     const b = document.createElement('b'); b.textContent = p.name;
     el.status.appendChild(b);
     el.status.appendChild(document.createTextNode(` · Cuadro ${n.frame + 1} · Tiro ${n.roll + 1}`));
-    const standing = game.world ? game.world.pins.filter((q) => q.state === 'standing').length : n.pinsStanding;
+    const standing = game.world ? game.world.pins.filter((q) => P.isStanding(q)).length : n.pinsStanding;
     el.pinsChip.innerHTML = 'Bolos en pie: ';
     const c = document.createElement('b'); c.textContent = String(standing);
     el.pinsChip.appendChild(c);
@@ -1321,7 +2575,7 @@ const Sound = (function () {
     game.stats = { strikes: 0, spares: 0, gutters: 0 };
     game.seed = game.seedOverride || ((Date.now() % 100000) | 1);
     game.seedOverride = null;
-    game.slowmo = 0; cam.shake = 0; cam.sx = 0; cam.sy = 0; particles.length = 0;
+    game.slowmo = 0; cam.shake = 0; cam.sx = 0; cam.sy = 0; particles.length = 0; camReset();
     game.timer = 0; game.sweep = null; game.lastRoll = null; game.lastThrow = null; game.resumeState = null;
     Sound.rollStop();
     buildScoreboard();
@@ -1343,8 +2597,7 @@ const Sound = (function () {
       for (const pin of game.world.pins) pin.alpha = 1;
     } else {
       // El pinsetter vuelve a colocar en su marca los bolos que quedaron en pie
-      const rack = Object.fromEntries(P.rackPositions().map((q) => [q.id, q]));
-      const standing = game.world.pins.filter((q) => q.state === 'standing').map((q) => ({ id: q.id, x: rack[q.id].x, y: rack[q.id].y }));
+      const standing = game.world.pins.filter((q) => P.isStanding(q)).map((q) => ({ id: q.id, x: RACK[q.id].x, z: RACK[q.id].z }));
       game.world = P.createWorld(game.seed++, standing);
       game.rack = { drop: 0, t: 0, dropping: false };
       for (const pin of game.world.pins) pin.alpha = 1;
@@ -1358,7 +2611,7 @@ const Sound = (function () {
     game.aimAngle = 0;
     game.timeScale = 1;
     game.skip = false;
-    cam.y = -CAM.back;
+    camReset();
     setStatus();
     updateScoreboard();
     el.hint.style.visibility = 'visible';
@@ -1401,6 +2654,8 @@ const Sound = (function () {
         Sound.rollStop();
         Sound.thud(0.8);
         addShake(3);
+      } else if (e.type === 'pit-pin') {
+        Sound.thud(0.3);
       } else if (e.type === 'stopped') {
         Sound.rollStop();
       }
@@ -1472,8 +2727,8 @@ const Sound = (function () {
   /** Split: el bolo 1 cayó y los bolos en pie no están todos conectados entre sí. */
   function isSplit(ids) {
     if (ids.length < 2 || ids.includes(1)) return false;
-    const pos = Object.fromEntries(P.rackPositions().map((p) => [p.id, p]));
-    const adj = (a, b) => Math.hypot(pos[a].x - pos[b].x, pos[a].y - pos[b].y) < LANE.pinSpacing * 1.05;
+    const pos = RACK;
+    const adj = (a, b) => Math.hypot(pos[a].x - pos[b].x, pos[a].z - pos[b].z) < LANE.pinSpacing * 1.05;
     const seen = new Set([ids[0]]);
     const stack = [ids[0]];
     while (stack.length) {
@@ -1492,7 +2747,7 @@ const Sound = (function () {
     if (frameDone) nextPlayer = (game.current + 1) % game.players.length;
     const allOver = game.players.every((q) => S.analyze(q.rolls).gameOver);
     const fullRack = allOver ? false : (nextPlayer !== game.current || S.analyze(game.players[nextPlayer].rolls).next.pinsStanding === 10);
-    game.sweep = { t: 0, fullRack, nextPlayer, allOver, camFrom: cam.y, camX: cam.x, duration: game.fast ? 0.08 : (fullRack ? 1.1 : 0.8) };
+    game.sweep = { t: 0, fullRack, nextPlayer, allOver, duration: game.fast ? 0.08 : (fullRack ? 1.4 : 1.0) };
     game.state = 'sweep';
     Sound.sweep();
   }
@@ -1588,10 +2843,10 @@ const Sound = (function () {
     const p = pointerPos(e);
     try { canvas.focus({ preventScroll: true }); } catch (err) { /* opcional */ }
     // Tocar cerca de la bola la coloca donde está el dedo; desde lejos, arrastrar la desplaza de forma relativa
-    const ballScreen = project(game.aimX, 0, BALL.radius);
+    const ballScreen = screenOf([game.aimX, BALL.radius, 0]);
     const near = Math.abs(p.x - ballScreen.x) < Math.max(70, ballScreen.s * BALL.radius * 3) && Math.abs(p.y - ballScreen.y) < Math.max(90, ballScreen.s * BALL.radius * 4);
-    if (near) game.aimX = clamp(groundX(p.x, 0), -LANE.halfWidth + BALL.radius * 0.6, LANE.halfWidth - BALL.radius * 0.6);
-    game.drag = { id: e.pointerId, down: p, mode: 'position', start: null, samples: [p], angle: 0, power: 0, relative: !near, startAimX: game.aimX, scale: project(0, 0, 0).s };
+    if (near) game.aimX = clamp(groundX(p.x, p.y), -LANE.halfWidth + BALL.radius * 0.6, LANE.halfWidth - BALL.radius * 0.6);
+    game.drag = { id: e.pointerId, down: p, mode: 'position', start: null, samples: [p], angle: 0, power: 0, relative: !near, startAimX: game.aimX, scale: ballScreen.s };
   });
   canvas.addEventListener('pointermove', (e) => {
     const d = game.drag;
@@ -1605,7 +2860,7 @@ const Sound = (function () {
       // Un gesto claramente vertical desde el principio es un lanzamiento: la bola no se mueve
       if (dy > 10 && dy > Math.abs(dx) * 1.2) { d.mode = 'swipe'; d.start = d.down; }
       else if (Math.abs(dx) > 4 || dy <= 10) {
-        const target = d.relative ? d.startAimX + dx / d.scale : groundX(p.x, 0);
+        const target = d.relative ? d.startAimX + dx / d.scale : groundX(p.x, d.down.y);
         game.aimX = clamp(target, -LANE.halfWidth + BALL.radius * 0.6, LANE.halfWidth - BALL.radius * 0.6);
         if (dy > 14) { d.mode = 'swipe'; d.start = p; }
       }
@@ -1805,20 +3060,13 @@ const Sound = (function () {
         game.power.value = ph < 0.5 ? ph * 2 : 2 - ph * 2;
         el.powerFill.style.width = (game.power.value * 100).toFixed(1) + '%';
       }
-      cam.y += (-CAM.back - cam.y) * Math.min(1, 6 * dt);
-      cam.x += (0 - cam.x) * Math.min(1, 6 * dt);
     } else if (game.state === 'rolling') {
       let scale = game.timeScale;
       if (game.slowmo > 0) { game.slowmo -= dt; scale *= 0.28; }
       const w = game.world;
       P.step(w, dt * scale * (game.fast ? 6 : 1), onWorldEvents);
       const b = w.ball;
-      Sound.rollUpdate(b.inPit || b.stopped ? 0 : Math.hypot(b.vx, b.vy), b.inGutter, b.x / LANE.halfWidth);
-      // cámara: sigue la bola, sin pasar de la zona de pinos
-      const target = clamp(b.y - CAM.back, -CAM.back, CAM.maxY);
-      cam.y += (target - cam.y) * Math.min(1, 7 * dt);
-      cam.x += (clamp(b.x * 0.4, -0.3, 0.3) - cam.x) * Math.min(1, 5 * dt);
-      for (const p of w.pins) if (p.state === 'fallen') p.tilt = Math.min(1, (p.tilt || 0) + dt * scale * 4.5);
+      Sound.rollUpdate(b.inPit || b.stopped ? 0 : Math.hypot(b.v[0], b.v[2]), b.inGutter, b.p[0] / LANE.halfWidth);
       if (w.finished) finishRoll();
     } else if (game.state === 'result') {
       game.timer -= dt;
@@ -1829,303 +3077,129 @@ const Sound = (function () {
       const t = sw.t / sw.duration;
       const w = game.world;
       // La barra recorre la zona de pinos de delante hacia atrás; los pinos desaparecen al pasar
-      sw.barY = lerp(LANE.deckStartY - 0.2, LANE.pitY + 0.1, easeInOut(clamp(t * 1.25, 0, 1)));
-      for (const p of w.pins) {
-        const goes = p.state !== 'standing' || sw.fullRack;
-        if (goes && sw.barY > p.y - 0.15) p.alpha = Math.max(0, (p.alpha == null ? 1 : p.alpha) - dt / Math.max(0.08, sw.duration * 0.25));
+      // La barra baja, recorre la zona de bolos empujando la madera caída al foso y vuelve; los bolos en pie se elevan
+      const tb = clamp((t - 0.1) / 0.7, 0, 1);
+      sw.barZ = lerp(LANE.deckStartZ - 0.25, LANE.pitZ + 0.15, easeInOut(tb));
+      sw.lift = sw.fullRack ? 0 : 0.28 * Math.sin(Math.PI * clamp(t, 0, 1));
+      if (!game.fast) {
+        if (t > 0.1 && t < 0.85) P.sweepPush(w, sw.barZ, sw.fullRack);
+        P.step(w, dt * 1.0, null, true);
       }
-      cam.y = lerp(sw.camFrom, -CAM.back, easeInOut(t));
-      cam.x = lerp(sw.camX, 0, easeInOut(t));
       if (t >= 1) endSweep();
     }
   }
 
-  // ------------------------------------------------------------ render
-  const BOARD_LINES = ['rgba(90,55,20,0.22)', 'rgba(90,55,20,0.14)', 'rgba(255,230,190,0.16)', 'rgba(90,55,20,0.18)', 'rgba(90,55,20,0.1)'];
-  const APPROACH_LINES = ['rgba(90,60,30,0.16)', 'rgba(255,235,200,0.12)', 'rgba(90,60,30,0.1)'];
-  function quad(a, b, c, d, fill, stroke) {
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.closePath();
-    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
-    if (stroke) { ctx.strokeStyle = stroke; ctx.stroke(); }
+  // ------------------------------------------------------------ render 3D (WebGL)
+  let R3 = null;
+  try { R3 = BowlingRenderer3D.create(canvas, P); } catch (e) { console.warn('WebGL no disponible, usando el dibujo 2D', e); R3 = null; }
+  const CAMERA = {
+    aimEye: [0, 1.25, -3.6], aimTarget: [0, 0.3, 9],
+    back: 3.0, height: 1.1, pinCamZ: 15.0,
+  };
+  const camState = { eye: CAMERA.aimEye.slice(), target: CAMERA.aimTarget.slice() };
+  function camReset() {
+    camState.eye = CAMERA.aimEye.slice(); camState.target = CAMERA.aimTarget.slice();
+    if (R3) { R3.cam.eye = camState.eye.slice(); R3.cam.target = camState.target.slice(); }
   }
-
-  function drawScene() {
-    const hw = LANE.halfWidth, kb = LANE.kickbackX;
-    const nearY = cam.y + 0.3;        // justo delante de la cámara
-    const hz = horizonY();
-
-    // Fondo: techo oscuro con luz cálida sobre la pista
-    const bg = ctx.createLinearGradient(0, 0, 0, H);
-    bg.addColorStop(0, '#05070d'); bg.addColorStop(Math.max(0.01, hz / H), '#121a2c'); bg.addColorStop(1, '#0a0d16');
-    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
-
-    // Suelo lateral (más allá de los canales) y pistas vecinas atenuadas
-    const farY = LANE.endY;
-    quad(project(-kb - 6, nearY, 0), project(kb + 6, nearY, 0), project(kb + 6, farY, 0), project(-kb - 6, farY, 0), '#171c2a');
-    const pitch = 2 * kb + 0.5;   // distancia entre centros de pistas vecinas
-    for (const sgn of [-1, 1]) {
-      const cx = sgn * pitch;
-      const ya = Math.max(nearY, 0);
-      quad(project(cx - hw, ya, 0), project(cx + hw, ya, 0), project(cx + hw, LANE.pitY, 0), project(cx - hw, LANE.pitY, 0), '#5b4630');
-      quad(project(cx - hw - LANE.gutter, ya, 0), project(cx - hw, ya, 0), project(cx - hw, LANE.pitY, 0), project(cx - hw - LANE.gutter, LANE.pitY, 0), '#1d2230');
-      quad(project(cx + hw, ya, 0), project(cx + hw + LANE.gutter, ya, 0), project(cx + hw + LANE.gutter, LANE.pitY, 0), project(cx + hw, LANE.pitY, 0), '#1d2230');
-      if (nearY < 0) quad(project(cx - hw - LANE.gutter, nearY, 0), project(cx + hw + LANE.gutter, nearY, 0), project(cx + hw + LANE.gutter, 0, 0), project(cx - hw - LANE.gutter, 0, 0), '#4f4030');
-    }
-
-    // Zona de aproximación (madera más clara) hasta la línea de falta, con juntas como líneas
-    if (nearY < 0) {
-      const xl = -hw - LANE.gutter, xr = hw + LANE.gutter;
-      quad(project(xl, nearY, 0), project(xr, nearY, 0), project(xr, 0, 0), project(xl, 0, 0), '#bf9264');
-      const aw = (xr - xl) / 55;
-      ctx.lineWidth = 1;
-      for (let i = 1; i < 55; i++) {
-        const x = xl + i * aw;
-        const a = project(x, nearY, 0), b = project(x, 0, 0);
-        ctx.strokeStyle = APPROACH_LINES[i % APPROACH_LINES.length];
-        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  function camGoal() {
+    const w = game.world;
+    const b = w && w.ball;
+    if (game.state === 'rolling' && b && b.active) {
+      const bx = clamp(b.p[0] * 0.6, -0.8, 0.8);
+      if (b.p[2] > CAMERA.pinCamZ || b.inPit) {
+        return { eye: [bx * 0.4, 1.5, CAMERA.pinCamZ - 0.7], target: [b.p[0] * 0.3, 0.35, LANE.headPinZ + 0.6] };
       }
+      return { eye: [bx, CAMERA.height, b.p[2] - CAMERA.back], target: [b.p[0] * 0.8, 0.22, b.p[2] + 2.2] };
     }
-
-    // Pista: un solo relleno y las juntas de las 39 tablas como líneas (barato de dibujar)
-    const y0 = Math.max(nearY, 0), y1 = LANE.pitY;
-    const bw = LANE.width / LANE.boards;
-    quad(project(-hw, y0, 0), project(hw, y0, 0), project(hw, y1, 0), project(-hw, y1, 0), '#d2a06a');
-    ctx.lineWidth = 1;
-    for (let i = 1; i < LANE.boards; i++) {
-      const x = -hw + i * bw;
-      const a = project(x, y0, 0), b = project(x, y1, 0);
-      ctx.strokeStyle = BOARD_LINES[i % BOARD_LINES.length];
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    if (game.state === 'result' || game.state === 'sweep') {
+      return { eye: [0.55, 1.5, CAMERA.pinCamZ - 0.7], target: [0, 0.35, LANE.headPinZ + 0.6] };
     }
-    // Brillo del aceite y oscurecimiento con la distancia
-    const laneNear = project(0, y0, 0), laneFar = project(0, y1, 0);
-    const sheen = ctx.createLinearGradient(0, laneNear.y, 0, laneFar.y);
-    sheen.addColorStop(0, 'rgba(255,255,255,0.10)'); sheen.addColorStop(0.35, 'rgba(255,255,255,0.03)'); sheen.addColorStop(1, 'rgba(0,0,0,0.38)');
-    quad(project(-hw, y0, 0), project(hw, y0, 0), project(hw, y1, 0), project(-hw, y1, 0), sheen);
-    // Zona de pinos un poco más oscura
-    quad(project(-hw, LANE.deckStartY, 0), project(hw, LANE.deckStartY, 0), project(hw, y1, 0), project(-hw, y1, 0), 'rgba(40,25,10,0.25)');
-
-    // Canales
-    for (const sgn of [-1, 1]) {
-      const xi = sgn * hw, xo = sgn * (hw + LANE.gutter);
-      quad(project(xi, y0, 0), project(xo, y0, 0), project(xo, y1, 0), project(xi, y1, 0), '#262c38');
-      quad(project(xi, y0, 0), project(xi + sgn * LANE.gutter * 0.5, y0, 0), project(xi + sgn * LANE.gutter * 0.5, y1, 0), project(xi, y1, 0), 'rgba(0,0,0,0.35)');
+    return { eye: [game.aimX * 0.5, CAMERA.aimEye[1], CAMERA.aimEye[2]], target: [game.aimX * 0.3 + Math.sin(game.aimAngle) * 6, CAMERA.aimTarget[1], CAMERA.aimTarget[2]] };
+  }
+  function camUpdate(dt) {
+    if (game.freezeCam) return;
+    const goal = camGoal();
+    const k = 1 - Math.exp(-(game.state === 'sweep' ? 2.5 : 5) * dt);
+    const k2 = 1 - Math.exp(-8 * dt);
+    for (let i = 0; i < 3; i++) {
+      camState.eye[i] += (goal.eye[i] - camState.eye[i]) * k;
+      camState.target[i] += (goal.target[i] - camState.target[i]) * k2;
     }
-    // Foso y pared del fondo
-    quad(project(-kb, y1, 0), project(kb, y1, 0), project(kb, farY, 0), project(-kb, farY, 0), '#07090f');
-    const wallBase = project(0, farY, 0), wallTop = project(0, farY, 1.3);
-    ctx.fillStyle = '#141b2b';
-    ctx.fillRect(0, Math.min(wallTop.y, hz - 2) - 2, W, Math.max(0, wallBase.y - Math.min(wallTop.y, hz - 2) + 2));
-    // Rótulo del fondo (brillo barato: dos capas de texto, sin desenfoque)
-    const sign = project(0, farY, 1.12);
-    if (sign.s > 20) {
-      ctx.save();
-      const size = Math.max(8, sign.s * 0.16);
-      ctx.font = `700 ${size}px system-ui, sans-serif`;
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      if ('letterSpacing' in ctx) ctx.letterSpacing = '0.2em';
-      ctx.fillStyle = 'rgba(245,185,66,0.22)';
-      ctx.font = `700 ${size * 1.08}px system-ui, sans-serif`;
-      ctx.fillText('BOWLING', sign.x, sign.y);
-      ctx.font = `700 ${size}px system-ui, sans-serif`;
-      ctx.fillStyle = 'rgba(245,185,66,0.8)';
-      ctx.fillText('BOWLING', sign.x, sign.y);
-      ctx.restore();
-    }
-    // Franja luminosa (masking unit)
-    const stripTop = project(0, farY, 0.95), stripBot = project(0, farY, 0.75);
-    const g2 = ctx.createLinearGradient(0, stripTop.y, 0, stripBot.y);
-    g2.addColorStop(0, 'rgba(245,185,66,0.0)'); g2.addColorStop(0.5, 'rgba(245,185,66,0.55)'); g2.addColorStop(1, 'rgba(245,185,66,0.0)');
-    ctx.fillStyle = g2;
-    const wl = project(-kb, farY, 0.8), wr = project(kb, farY, 0.8);
-    ctx.fillRect(wl.x, stripTop.y, wr.x - wl.x, Math.max(1, stripBot.y - stripTop.y));
-    // Paredes laterales (kickbacks)
-    for (const sgn of [-1, 1]) {
-      const x = sgn * kb;
-      quad(project(x, LANE.deckStartY - 0.4, 0), project(x, farY, 0), project(x, farY, 0.5), project(x, LANE.deckStartY - 0.4, 0.5), sgn < 0 ? '#2a3142' : '#232a3a');
-    }
-
-    // Marcas: línea de falta, puntos, flechas y marcas de los pinos
-    const fl = project(-hw, 0, 0), fr = project(hw, 0, 0);
-    if (y0 <= 0.01) { ctx.strokeStyle = 'rgba(20,10,0,0.75)'; ctx.lineWidth = Math.max(1, fl.s * 0.02); ctx.beginPath(); ctx.moveTo(fl.x, fl.y); ctx.lineTo(fr.x, fr.y); ctx.stroke(); }
-    ctx.fillStyle = 'rgba(35,22,10,0.42)';
-    for (const b of [10, 15, 20, 25, 30]) {
-      const x = (b - 20) * bw; const p = project(x, LANE.dotsY, 0);
-      ctx.beginPath(); ctx.ellipse(p.x, p.y, Math.max(1, p.s * 0.016), Math.max(0.6, p.s * 0.016 * cam.sin), 0, 0, Math.PI * 2); ctx.fill();
-    }
-    for (const b of [5, 10, 15, 20, 25, 30, 35]) {
-      const x = (b - 20) * bw, y = LANE.arrowsY + Math.abs(b - 20) * 0.03;
-      const tip = project(x, y + 0.2, 0), l = project(x - 0.017, y, 0), r = project(x + 0.017, y, 0), m = project(x, y + 0.06, 0);
-      ctx.beginPath(); ctx.moveTo(tip.x, tip.y); ctx.lineTo(l.x, l.y); ctx.lineTo(m.x, m.y); ctx.lineTo(r.x, r.y); ctx.closePath(); ctx.fill();
-    }
-    ctx.fillStyle = 'rgba(0,0,0,0.28)';
-    for (const sp of P.rackPositions()) {
-      const p = project(sp.x, sp.y, 0);
-      ctx.beginPath(); ctx.ellipse(p.x, p.y, Math.max(1, p.s * 0.03), Math.max(0.6, p.s * 0.03 * cam.sin), 0, 0, Math.PI * 2); ctx.fill();
+    if (R3) {
+      R3.cam.eye = [camState.eye[0] + cam.sx * 0.002, camState.eye[1] + cam.sy * 0.002, camState.eye[2]];
+      R3.cam.target = camState.target.slice();
+      const aspect = W / Math.max(1, H);
+      // Campo horizontal aproximadamente constante: en vertical se abre el vertical
+      const hfov = 58 * Math.PI / 180;
+      R3.cam.fov = clamp(2 * Math.atan(Math.tan(hfov / 2) / aspect), 38 * Math.PI / 180, 80 * Math.PI / 180);
     }
   }
-
-  function drawShadow(x, y, rx, ry, alpha) {
-    const p = project(x, y, 0);
-    ctx.fillStyle = `rgba(0,0,0,${alpha})`;
-    ctx.beginPath(); ctx.ellipse(p.x, p.y, Math.max(0.5, p.s * rx), Math.max(0.5, p.s * ry * cam.sin), 0, 0, Math.PI * 2); ctx.fill();
+  /** Coordenada x del suelo bajo un píxel (para colocar la bola en la línea de falta). */
+  function groundX(sx, sy) {
+    if (R3) { const g = R3.groundFromScreen(sx, sy, W, H); if (g) return g.x; }
+    return (sx / W - 0.5) * 2 * LANE.halfWidth;
   }
-
-  function pinPath(w, L) {
-    // Silueta del pino en coordenadas locales: base en (0,0), cabeza en (0,-L)
-    const r = w / 2;
-    ctx.beginPath();
-    ctx.moveTo(-r * 0.62, 0);
-    ctx.bezierCurveTo(-r * 1.02, -L * 0.14, -r * 1.02, -L * 0.42, -r * 0.55, -L * 0.6);
-    ctx.bezierCurveTo(-r * 0.4, -L * 0.66, -r * 0.4, -L * 0.72, -r * 0.5, -L * 0.8);
-    ctx.bezierCurveTo(-r * 0.62, -L * 0.98, r * 0.62, -L * 0.98, r * 0.5, -L * 0.8);
-    ctx.bezierCurveTo(r * 0.4, -L * 0.72, r * 0.4, -L * 0.66, r * 0.55, -L * 0.6);
-    ctx.bezierCurveTo(r * 1.02, -L * 0.42, r * 1.02, -L * 0.14, r * 0.62, 0);
-    ctx.closePath();
+  function screenOf(p) {
+    if (R3) { const s = R3.project(p, W, H); const s2 = R3.project([p[0] + 0.1, p[1], p[2]], W, H); return { x: s.x, y: s.y, s: Math.abs(s2.x - s.x) / 0.1 }; }
+    return { x: W / 2 + p[0] * 200, y: H * 0.75, s: 200 };
   }
-
-  function drawPin(p) {
-    const alpha = p.alpha == null ? 1 : p.alpha;
-    if (alpha <= 0.01 || p.state === 'pit') return;
-    const dropZ = (game.rack.dropping ? game.rack.drop : 0) * 0.5;
-    const h = PIN.height;
-    const tilt = p.state === 'fallen' ? easeOut(p.tilt == null ? 1 : p.tilt) : 0;
-    const base = project(p.x, p.y, dropZ);
-    const tx = p.x + p.fallDir.x * h * 0.95 * tilt, ty = p.y + p.fallDir.y * h * 0.95 * tilt;
-    const tz = dropZ + h * (1 - tilt) + PIN.radius * 0.9 * tilt;
-    const top = project(tx, ty, tz);
-    const dx = top.x - base.x, dy = top.y - base.y;
-    const L = Math.max(2, Math.hypot(dx, dy));
-    const w = Math.max(1.5, base.s * PIN.radius * 2);
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    if (tilt < 0.999 || dropZ > 0) drawShadow(p.x + p.fallDir.x * h * 0.45 * tilt, p.y + p.fallDir.y * h * 0.45 * tilt, PIN.radius * (1 + tilt * 2.2), PIN.radius * 0.9, 0.28);
-    ctx.translate(base.x, base.y);
-    ctx.rotate(Math.atan2(dx, -dy));
-    if (p.wobbleT != null && p.wobbleT < 1.4 && tilt === 0) ctx.rotate(Math.sin(p.wobbleT * 28) * 0.09 * Math.exp(-3 * p.wobbleT));
-    pinPath(w, L);
-    const grad = ctx.createLinearGradient(-w / 2, 0, w / 2, 0);
-    grad.addColorStop(0, '#b9bcc6'); grad.addColorStop(0.35, '#ffffff'); grad.addColorStop(0.7, '#f1f2f5'); grad.addColorStop(1, '#9ea3b1');
-    ctx.fillStyle = grad; ctx.fill();
-    ctx.save(); ctx.clip();
-    ctx.fillStyle = '#d9262f';
-    ctx.fillRect(-w, -L * 0.70, w * 2, Math.max(1, L * 0.035));
-    ctx.fillRect(-w, -L * 0.63, w * 2, Math.max(1, L * 0.035));
-    ctx.restore();
-    if (w > 6) { ctx.strokeStyle = 'rgba(40,40,60,0.35)'; ctx.lineWidth = 1; ctx.stroke(); }
-    ctx.restore();
-  }
-
-  /** Barra del pinsetter que barre la zona de pinos. */
-  function drawSweepBar(y) {
-    const hw = LANE.halfWidth + 0.02;
-    const a = project(-hw, y, 0.02), b = project(hw, y, 0.02), c = project(hw, y, 0.16), d = project(-hw, y, 0.16);
-    ctx.fillStyle = '#2c3446';
-    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.closePath(); ctx.fill();
-    ctx.fillStyle = 'rgba(0,0,0,0.25)';
-    ctx.fillRect(Math.min(a.x, d.x), a.y, Math.abs(b.x - a.x), Math.max(1, a.s * 0.03));
-  }
-
-  function drawBall(x, y, z, traveled, hidden) {
-    if (hidden) return;
-    const r = BALL.radius;
-    drawShadow(x, y, r * 1.05, r * 1.0, 0.35);
-    const c = project(x, y, r + (z || 0));
-    const rp = c.s * r;
-    if (rp < 0.5) return;
-    ctx.save();
-    ctx.beginPath(); ctx.arc(c.x, c.y, rp, 0, Math.PI * 2); ctx.clip();
-    const g = ctx.createRadialGradient(c.x - rp * 0.4, c.y - rp * 0.45, rp * 0.1, c.x, c.y, rp * 1.05);
-    g.addColorStop(0, '#8b7bff'); g.addColorStop(0.35, '#4a3bd6'); g.addColorStop(0.8, '#1d1560'); g.addColorStop(1, '#0a0730');
-    ctx.fillStyle = g; ctx.fillRect(c.x - rp, c.y - rp, rp * 2, rp * 2);
-    // veta de mármol
-    ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = Math.max(1, rp * 0.12);
-    const phi = traveled / r;
-    for (let k = 0; k < 2; k++) {
-      const a = phi * 0.5 + k * 2.1;
-      ctx.beginPath(); ctx.ellipse(c.x + Math.cos(a) * rp * 0.3, c.y + Math.sin(a) * rp * 0.5, rp * 0.9, rp * 0.35, a, 0, Math.PI * 2); ctx.stroke();
-    }
-    // agujeros: giran con el rodar de la bola (la cara frontal sube al alejarse)
-    const holes = [{ a: 0, x: -0.24, r: 0.12 }, { a: 0, x: 0.24, r: 0.12 }, { a: 0.62, x: 0, r: 0.14 }];
-    ctx.fillStyle = '#05030f';
-    for (const hole of holes) {
-      const a = phi + hole.a;
-      const s = Math.sin(a);
-      if (s >= 0) continue;                 // cara trasera
-      const vis = -s;
-      ctx.globalAlpha = Math.min(1, vis * 1.6);
-      ctx.beginPath();
-      ctx.ellipse(c.x + hole.x * rp * (0.75 + 0.25 * vis), c.y - Math.cos(a) * rp * 0.9, hole.r * rp, hole.r * rp * Math.max(0.15, vis), 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-    ctx.restore();
-    // brillo
-    ctx.beginPath(); ctx.arc(c.x - rp * 0.35, c.y - rp * 0.4, rp * 0.18, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.fill();
-  }
-
-  /** Trayectoria prevista (sin pinos) para la guía de puntería. */
-  function predictPath(x, angle, speed, spin) {
-    const pts = [];
-    let px = x, py = 0, vx = Math.sin(angle) * speed, vy = Math.cos(angle) * speed, hooked = 0;
-    const dt = 0.03;
-    const reserve = SIM.hookReserve * Math.abs(spin);
-    for (let i = 0; i < 400 && py < LANE.deckStartY; i++) {
-      const sp = Math.hypot(vx, vy); if (sp < 0.1) break;
-      const prof = P.hookProfile(py);
-      const ns = Math.max(0, sp - (SIM.ballDecel + (SIM.ballDecelDry - SIM.ballDecel) * prof) * dt) / sp; vx *= ns; vy *= ns;
-      const k = Math.min(1, (sp / SIM.hookSpeedRef) * (sp / SIM.hookSpeedRef));
-      const dv = SIM.hookAccel * spin * prof * k * dt;
-      if (hooked + Math.abs(dv) <= reserve) { vx += dv; hooked += Math.abs(dv); }
-      px += vx * dt; py += vy * dt;
-      if (Math.abs(px) > LANE.halfWidth + BALL.radius * 0.35) { pts.push({ x: px, y: py, gutter: true }); break; }
-      if (i % 3 === 0) pts.push({ x: px, y: py });
-    }
-    return pts;
-  }
-  function drawGuide() {
+  /** Trayectoria prevista para la guía (misma física, sin bolos). */
+  function guidePoints() {
     const dragging = game.drag && game.drag.mode === 'swipe';
     const speed = dragging ? lerp(SIM.minSpeed, SIM.maxSpeed, game.drag.power) : (game.power.active ? lerp(SIM.minSpeed, SIM.maxSpeed, game.power.value) : 7.5);
-    const pts = predictPath(game.aimX, game.aimAngle, speed, game.spin);
-    if (pts.length < 2) return;
-    ctx.save();
-    ctx.setLineDash([6, 8]);
-    ctx.lineWidth = dragging ? 2.5 : 1.5;
-    ctx.lineCap = 'round';
-    const first = project(pts[0].x, pts[0].y, 0), last = project(pts[pts.length - 1].x, pts[pts.length - 1].y, 0);
-    const g = ctx.createLinearGradient(first.x, first.y, last.x, last.y);
-    const gutter = pts[pts.length - 1].gutter;
-    const col = gutter ? '248,113,113' : (dragging ? '245,185,66' : '56,189,248');
-    g.addColorStop(0, `rgba(${col},${dragging ? 0.95 : 0.55})`); g.addColorStop(1, `rgba(${col},0.05)`);
-    ctx.strokeStyle = g;
-    ctx.beginPath();
-    pts.forEach((p, i) => { const s = project(p.x, p.y, 0); if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y); });
-    ctx.stroke();
-    ctx.restore();
+    return P.predictPath({ x: game.aimX, speed, angle: game.aimAngle, spin: game.spin });
   }
-
+  let guideCache = { key: '', pts: [] };
   function render() {
-    drawScene();
     const w = game.world;
+    if (!R3) { render2D(); return; }
     if (!w) return;
-    // Entidades ordenadas de lejos a cerca
-    const items = [];
-    for (const p of w.pins) if (p.state !== 'pit') items.push({ y: p.y, draw: () => drawPin(p) });
+    const dropZ = game.rack.dropping ? game.rack.drop * 0.5 : 0;
+    const lift = game.state === 'sweep' && game.sweep ? game.sweep.lift || 0 : 0;
+    const pins = w.pins.map((p) => {
+      const dy = (dropZ) + (lift && P.isStanding(p) ? lift : 0);
+      return { p: dy ? [p.p[0], p.p[1] + dy, p.p[2]] : p.p, q: p.q, state: p.state, alpha: 1 };
+    });
     const b = w.ball;
-    if (game.state === 'aim') items.push({ y: 0, draw: () => drawBall(game.aimX, 0, 0, 0, false) });
-    else if (b.active && !b.inPit) items.push({ y: b.y, draw: () => drawBall(b.x, b.y, b.inGutter ? -0.06 : 0, b.traveled, false) });
-    if (game.state === 'sweep' && game.sweep && game.sweep.barY != null) items.push({ y: game.sweep.barY, draw: () => drawSweepBar(game.sweep.barY) });
-    items.sort((a, c) => c.y - a.y);
-    for (const it of items) it.draw();
-    if (game.state === 'aim' && !anyOverlayOpen()) drawGuide();
-    // confeti
+    let ball;
+    if (game.state === 'aim') ball = { p: [game.aimX, BALL.radius, 0], q: [0, 0, 0, 1], visible: true };
+    else ball = { p: b.p, q: b.q, visible: b.active && !(b.inPit && (b.pitT > 1.2 || b.p[1] < -0.25)) };
+    let guide = null;
+    if (game.state === 'aim' && !anyOverlayOpen()) {
+      const key = [game.aimX.toFixed(3), game.aimAngle.toFixed(4), game.spin, game.drag && game.drag.mode === 'swipe' ? game.drag.power.toFixed(2) : (game.power.active ? game.power.value.toFixed(2) : 'n')].join('|');
+      if (key !== guideCache.key) guideCache = { key, pts: guidePoints() };
+      guide = guideCache.pts;
+    }
+    const sweep = game.state === 'sweep' && game.sweep && game.sweep.barZ != null ? { y: 0.0, z: game.sweep.barZ } : null;
+    R3.render({ pins, ball, guide, sweep });
+    drawParticles();
+  }
+  // Lienzo 2D superpuesto para el confeti y para el modo sin WebGL
+  const canvas2d = document.createElement('canvas');
+  canvas2d.id = 'overlay2d';
+  canvas2d.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;';
+  canvas.parentNode.insertBefore(canvas2d, canvas.nextSibling);
+  const ctx = canvas2d.getContext('2d');
+  function drawParticles() {
+    ctx.clearRect(0, 0, W, H);
     for (const p of particles) {
       ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
       ctx.globalAlpha = Math.min(1, p.life); ctx.fillStyle = p.color; ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
       ctx.restore();
     }
+  }
+  /** Dibujo 2D de emergencia (sin WebGL): vista cenital sencilla. */
+  function render2D() {
+    ctx.fillStyle = '#0b0f1a'; ctx.fillRect(0, 0, W, H);
+    const w = game.world; if (!w) return;
+    const sx = W / 2, scale = Math.min(W / 1.8, H / (LANE.endZ + 2));
+    const X = (x) => sx + x * scale, Y = (z) => H - (z + 1) * scale;
+    ctx.fillStyle = '#c99a63'; ctx.fillRect(X(-LANE.halfWidth), Y(LANE.pitZ), LANE.width * scale, (LANE.pitZ + 1) * scale);
+    ctx.fillStyle = '#334'; ctx.fillRect(X(-LANE.kickbackX), Y(LANE.pitZ), LANE.gutter * scale, (LANE.pitZ + 1) * scale); ctx.fillRect(X(LANE.halfWidth), Y(LANE.pitZ), LANE.gutter * scale, (LANE.pitZ + 1) * scale);
+    for (const p of w.pins) { if (p.state === 'pit') continue; ctx.fillStyle = P.isStanding(p) ? '#fff' : '#999'; ctx.beginPath(); ctx.arc(X(p.p[0]), Y(p.p[2]), Math.max(2, PIN.beltRadius * scale), 0, Math.PI * 2); ctx.fill(); }
+    const b = w.ball; const bp = game.state === 'aim' ? [game.aimX, 0, 0] : b.p;
+    ctx.fillStyle = '#5b4bd6'; ctx.beginPath(); ctx.arc(X(bp[0]), Y(bp[2]), Math.max(3, BALL.radius * scale), 0, Math.PI * 2); ctx.fill();
+    for (const p of particles) { ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.globalAlpha = Math.min(1, p.life); ctx.fillStyle = p.color; ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h); ctx.restore(); }
   }
 
   // ------------------------------------------------------------ bucle principal
@@ -2134,7 +3208,7 @@ const Sound = (function () {
   function frame(now) {
     const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
     last = now;
-    if (!paused) { update(dt); render(); }
+    if (!paused) { update(dt); camUpdate(dt); render(); }
     requestAnimationFrame(frame);
   }
   document.addEventListener('visibilitychange', () => {
@@ -2143,12 +3217,13 @@ const Sound = (function () {
   });
 
   // ------------------------------------------------------------ arranque
+  game.world = P.createWorld(1);
   resize();
+  camReset();
   applySound();
   setSpin(0);
   syncInert();
   focusIn(el.overlaySetup);
-  game.world = P.createWorld(1);
   requestAnimationFrame(frame);
 
   // ------------------------------------------------------------ API de depuración / pruebas automáticas
@@ -2159,16 +3234,18 @@ const Sound = (function () {
     /** Aplica un tiro sin física: derriba `n` pinos en pie (para probar el marcador). */
     applyRoll(n) {
       if (game.state !== 'aim') return false;
-      const standing = game.world.pins.filter((p) => p.state === 'standing');
+      const standing = game.world.pins.filter((p) => P.isStanding(p));
       if (!Number.isInteger(n) || n < 0 || n > standing.length) return false;
       if (!S.isValidRoll(game.players[game.current].rolls, n)) return false;
-      game.world.ball.active = true; game.world.ball.inPit = true;
-      standing.slice(0, n).forEach((p) => { p.state = 'fallen'; p.tilt = 1; p.fallDir = { x: 0, y: 1 }; });
+      game.world.ball.active = true; game.world.ball.inPit = true; game.world.ball.p = [0, -0.5, LANE.pitZ + 0.5];
+      standing.slice(0, n).forEach((p) => { p.state = 'pit'; p.awake = false; p.p = [p.p[0], -0.6, LANE.pitZ + 0.4]; p.upY = 0; });
       game.world.finished = true;
       finishRoll();
       return true;
     },
     setFast(v) { game.fast = !!v; },
+    renderer() { return R3; },
+    freezeCamera(eye, target) { game.freezeCam = !!eye; if (eye && R3) { R3.cam.eye = eye; R3.cam.target = target; } },
     setSeed(n) { game.seed = (n >>> 0) || 1; game.seedOverride = game.seed; },
     skip() { return skipAhead(); },
     lastThrow() { return game.lastThrow ? Object.assign({}, game.lastThrow) : null; },
@@ -2177,7 +3254,7 @@ const Sound = (function () {
       return {
         state: game.state, current: game.current,
         players: game.players.map((p) => ({ name: p.name, rolls: p.rolls.slice(), total: S.analyze(p.rolls).total, gameOver: S.analyze(p.rolls).gameOver })),
-        standing: game.world ? game.world.pins.filter((p) => p.state === 'standing').map((p) => p.id) : [],
+        standing: game.world ? game.world.pins.filter((p) => P.isStanding(p)).map((p) => p.id) : [],
         lastRoll: game.lastRoll || null,
         aimX: game.aimX, spin: game.spin,
       };

@@ -6,11 +6,20 @@ sin servidor y sin recursos externos: abre `index.html` en cualquier navegador m
 
 ## Características
 
-- **Física real en 2D** con vista pseudo-3D: dimensiones oficiales USBC de la pista
-  (41,5 in de ancho, 60 ft hasta el bolo 1, bolos a 12 in), bola de 15 lb, bolos de
-  3 lb 6 oz, colisiones por impulso con restitución y fricción, canales, paredes
-  laterales (*kickbacks*) y foso.
-- **Efecto (gancho)**: la bola curva más al final de la pista, como en una pista aceitada.
+- **Física 3D de cuerpos rígidos** escrita desde cero: los bolos son cuerpos con
+  orientación e inercia que vuelcan, vuelan, giran y rebotan en las paredes y el foso;
+  la bola patina, gancha y rueda por fricción de Coulomb real con el aceite de la
+  pista (patrón de 42 ft) y la madera seca del final. Dimensiones oficiales USBC
+  (41,5 in de ancho, 60 ft hasta el bolo 1, bolos a 12 in, canales de 9,25 in,
+  foso a 62 ft 10 3/16 in), bola de 15 lb, bolos de 3 lb 6 oz.
+- **Renderizado WebGL propio** (sin librerías): iluminación física (GGX/Fresnel),
+  sombras suaves, reflejos planares de la pista aceitada, madera, bola de resina y
+  bolos generados proceduralmente, foco sobre la zona de bolos, tono ACES y FXAA.
+  Si WebGL no está disponible se usa una vista cenital 2D sencilla.
+- **Efecto (gancho)**: el giro de la bola y la fricción hacen que patine en el aceite y
+  curve en la zona seca, con el ángulo de entrada de una bola real.
+- **Pinsetter**: la barra recoge la madera caída y la empuja al foso; los bolos en pie
+  se elevan y vuelven a su marca; el rack nuevo baja desde arriba.
 - **Marcador oficial**: strikes, spares, bonos, cuadro 10 con tiros extra, máximo 300.
   Los totales acumulados aparecen solo cuando ya se conocen (como en un marcador real).
 - **1 a 4 jugadores** por turnos, con nombres.
@@ -49,8 +58,9 @@ más strikes, igual que en la vida real.
 ## Estructura
 
 ```
-index.html   El juego completo (HTML + CSS + JS). Contiene cuatro bloques <script>:
-             scoring (marcador), physics (simulación), audio (sonido) y main (juego).
+index.html   El juego completo (HTML + CSS + JS). Contiene cinco bloques <script>:
+             scoring (marcador), physics (simulación 3D), audio (sonido),
+             gl (renderizador WebGL) y main (juego).
 tests/       Pruebas: scoring.test.js y physics.test.js (unitarias, Node) y e2e.test.js (Playwright).
 ```
 
