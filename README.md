@@ -33,6 +33,7 @@ sin servidor y sin recursos externos: abre `index.html` en cualquier navegador m
 | `?` | Ayuda. |
 
 Consejo: apunta al «bolsillo» entre el pino 1 y el 3 (o el 1 y el 2) con buena velocidad.
+A potencia máxima el tiro pierde algo de precisión (riesgo y recompensa).
 Una bola con efecto que entra en el bolsillo contrario al sentido del gancho consigue
 más strikes, igual que en la vida real.
 

@@ -258,7 +258,7 @@
           <dt><kbd>A</kbd> <kbd>D</kbd></dt><dd>Efecto (gancho) a izquierda o derecha. La bola curva más al final de la pista.</dd>
           <dt><kbd>Espacio</kbd></dt><dd>Arranca el medidor de potencia; pulsa de nuevo para lanzar.</dd>
           <dt><kbd>M</kbd></dt><dd>Silenciar / activar sonido.</dd>
-          <dt>Consejo</dt><dd>Apunta al «bolsillo» entre el pino 1 y el 3 (o el 1 y el 2) con buena velocidad para conseguir strikes.</dd>
+          <dt>Consejo</dt><dd>Apunta al «bolsillo» entre el pino 1 y el 3 (o el 1 y el 2) con buena velocidad para conseguir strikes. A potencia máxima el tiro pierde algo de precisión.</dd>
         </dl>
         <p>Puntuación: strike = 10 + los dos tiros siguientes; spare = 10 + el tiro siguiente. En el cuadro 10 un strike o spare da un tiro extra. Máximo: 300.</p>
         <div class="actions"><button class="btn primary" type="button" id="btn-help-close">Entendido</button></div>
@@ -486,7 +486,7 @@ const BowlingPhysics = (function () {
   LANE.halfWidth = LANE.width / 2;
   LANE.kickbackX = LANE.halfWidth + LANE.gutter;      // paredes laterales del foso
   LANE.deckStartY = LANE.headPinY - 0.9;              // inicio de la zona de pinos
-  LANE.pitY = LANE.headPinY + 3 * LANE.rowSpacing + 0.42; // borde del foso
+  LANE.pitY = LANE.headPinY + 34.1875 * IN;            // borde del foso (62 ft 10 3/16 in desde la línea de falta)
   LANE.endY = LANE.pitY + 0.9;                        // fondo del foso (pared)
 
   const BALL = { radius: 8.5 * IN / 2, mass: 6.8 };    // 0,108 m, 15 lb
@@ -495,8 +495,10 @@ const BowlingPhysics = (function () {
   /* Parámetros de simulación (ajustados con pruebas Monte Carlo). */
   const SIM = {
     dt: 1 / 240,                 // paso fijo
-    ballDecel: 0.55,             // m/s² en la pista aceitada
+    ballDecel: 0.42,             // m/s² en la zona aceitada (pierde ~1 m/s en 60 ft, como una bola real)
+    ballDecelDry: 0.7,           // en la zona seca final
     ballDecelDeck: 1.2,          // en la zona de pinos
+    hookReserve: 0.7,            // m/s: velocidad lateral máxima que puede ganar por el gancho (fase de rodadura)
     pinFriction: 4.5,            // deceleración de un pino que desliza en pie
     fallenFriction: 2.2,         // deceleración de un pino caído
     restBallPin: 0.3,
@@ -506,7 +508,7 @@ const BowlingPhysics = (function () {
     frictionPinPin: 0.35,
     fallImpact: 0.65,             // m/s de impacto normal para derribar un pino
     fallDisplacement: 0.09,      // m de desplazamiento desde su sitio para caer
-    hookAccel: 1.0,              // m/s² lateral con efecto máximo en la zona seca
+    hookAccel: 0.9,              // m/s² lateral con efecto máximo en la zona seca
     hookOilZone: 0.68,           // fracción de la pista con aceite (poco gancho)
     hookOilFactor: 0.1,
     minSpeed: 4.5,
@@ -514,9 +516,12 @@ const BowlingPhysics = (function () {
     maxAngle: 3 * Math.PI / 180, // ángulo máximo de salida
     stopSpeed: 0.03,
     pinWobble: 0.012,            // pequeño azar al caer (m/s)
-    sweepExtra: 0.08,            // radio extra de un pino mientras cae (su cuerpo al volcar barre más área)
+    sweepExtra: 0.09,            // radio extra de un pino mientras cae (su cuerpo al volcar barre más área)
     sweepDur: 0.3,               // duración (s) de ese barrido
     releaseJitter: 0.06 * Math.PI / 180, // pequeña variación humana del ángulo de salida (rad)
+    riskSpeed: 9.0,              // a partir de esta velocidad el tiro pierde precisión...
+    riskAngle: 0.2 * Math.PI / 180, // ...hasta ±0,2° de ángulo
+    riskOffset: 0.025,           // ...y ±2,5 cm de posición a máxima potencia
     speedJitter: 0.015,          // y de la velocidad (fracción)
     driveRate: 4,                // "empuje": la bola que rueda recupera su dirección tras chocar (1/s)
     rollAdapt: 1.5,              // velocidad a la que la dirección de rodadura se adapta tras los choques (1/s)
@@ -573,7 +578,7 @@ const BowlingPhysics = (function () {
       ball: {
         x: 0, y: 0, vx: 0, vy: 0, r: BALL.radius, m: BALL.mass,
         spin: 0, active: false, inGutter: false, inPit: false, stopped: false,
-        traveled: 0, time: 0, deckHit: false, rollDir: { x: 0, y: 1 },
+        traveled: 0, time: 0, deckHit: false, rollDir: { x: 0, y: 1 }, hooked: 0,
       },
       time: 0,
       events: [],   // eventos de colisión del último paso (para audio/efectos)
@@ -586,15 +591,20 @@ const BowlingPhysics = (function () {
   function throwBall(world, opts) {
     const b = world.ball;
     const jitter = opts.exact ? 0 : 1;
-    const speed = clamp(opts.speed, SIM.minSpeed, SIM.maxSpeed) * (1 + jitter * (world.random() * 2 - 1) * SIM.speedJitter);
-    const angle = clamp(opts.angle || 0, -SIM.maxAngle, SIM.maxAngle) + jitter * (world.random() * 2 - 1) * SIM.releaseJitter;
-    b.x = clamp(opts.x || 0, -LANE.halfWidth + 0.02, LANE.halfWidth - 0.02);
+    const baseSpeed = clamp(opts.speed, SIM.minSpeed, SIM.maxSpeed);
+    // A máxima potencia el tiro es menos preciso (riesgo/recompensa)
+    const over = clamp((baseSpeed - SIM.riskSpeed) / (SIM.maxSpeed - SIM.riskSpeed), 0, 1) * jitter;
+    const speed = baseSpeed * (1 + jitter * (world.random() * 2 - 1) * SIM.speedJitter);
+    const angle = clamp(opts.angle || 0, -SIM.maxAngle, SIM.maxAngle)
+      + jitter * (world.random() * 2 - 1) * SIM.releaseJitter
+      + over * (world.random() * 2 - 1) * SIM.riskAngle;
+    b.x = clamp((opts.x || 0) + over * (world.random() * 2 - 1) * SIM.riskOffset, -LANE.halfWidth + 0.02, LANE.halfWidth - 0.02);
     b.y = 0;
     b.vx = Math.sin(angle) * speed;
     b.vy = Math.cos(angle) * speed;
     b.spin = clamp(opts.spin || 0, -1, 1);
     b.active = true; b.inGutter = false; b.inPit = false; b.stopped = false;
-    b.traveled = 0; b.time = 0; b.deckHit = false;
+    b.traveled = 0; b.time = 0; b.deckHit = false; b.hooked = 0;
     b.rollDir = { x: Math.sin(angle), y: Math.cos(angle) };
     world.finished = false; world.settleTime = 0; world.time = 0;
   }
@@ -680,25 +690,27 @@ const BowlingPhysics = (function () {
     if (b.active && !b.inPit && !b.stopped) {
       b.time += dt;
       const inDeck = b.y > LANE.deckStartY;
-      applyFriction(b, inDeck ? SIM.ballDecelDeck : SIM.ballDecel, dt);
+      const prof = hookProfile(b.y);
+      applyFriction(b, inDeck ? SIM.ballDecelDeck : SIM.ballDecel + (SIM.ballDecelDry - SIM.ballDecel) * prof, dt);
       if (!b.inGutter && !inDeck && b.spin !== 0) {
-        b.vx += SIM.hookAccel * b.spin * hookProfile(b.y) * dt;
+        // La bola gancha hasta agotar su "reserva" de deslizamiento; después rueda recta.
+        const reserve = SIM.hookReserve * Math.abs(b.spin);
+        const dv = SIM.hookAccel * b.spin * prof * dt;
+        if (b.hooked + Math.abs(dv) <= reserve) { b.vx += dv; b.hooked += Math.abs(dv); }
       }
       const sp = Math.hypot(b.vx, b.vy);
       b.x += b.vx * dt; b.y += b.vy * dt;
       b.traveled += sp * dt;
 
-      if (!b.inGutter && !inDeck && Math.abs(b.x) > LANE.halfWidth + b.r * 0.35) {
+      if (!b.inGutter && Math.abs(b.x) > LANE.halfWidth + b.r * 0.35) {
+        // El canal llega hasta el foso: una bola que se sale (aunque sea junto a los pinos) ya no toca pinos
         b.inGutter = true;
         b.vx = 0;
-        world.events.push({ type: 'gutter', x: b.x, y: b.y });
+        world.events.push({ type: 'gutter', x: b.x, y: b.y, late: inDeck });
       }
       if (b.inGutter) {
         b.x = Math.sign(b.x) * (LANE.halfWidth + LANE.gutter / 2);
         b.vx = 0;
-      } else if (inDeck) {
-        if (b.x < -LANE.kickbackX + b.r) { b.x = -LANE.kickbackX + b.r; b.vx = Math.abs(b.vx) * SIM.restWall; }
-        if (b.x > LANE.kickbackX - b.r) { b.x = LANE.kickbackX - b.r; b.vx = -Math.abs(b.vx) * SIM.restWall; }
       }
       if (b.y - b.r > LANE.pitY) {
         b.inPit = true;
@@ -1383,7 +1395,7 @@ const Sound = (function () {
     if (frameDone) nextPlayer = (game.current + 1) % game.players.length;
     const allOver = game.players.every((q) => S.analyze(q.rolls).gameOver);
     const fullRack = allOver ? false : (nextPlayer !== game.current || S.analyze(game.players[nextPlayer].rolls).next.pinsStanding === 10);
-    game.sweep = { t: 0, fullRack, nextPlayer, allOver, camFrom: cam.y, duration: game.fast ? 0.08 : (fullRack ? 1.1 : 0.8) };
+    game.sweep = { t: 0, fullRack, nextPlayer, allOver, camFrom: cam.y, camX: cam.x, duration: game.fast ? 0.08 : (fullRack ? 1.1 : 0.8) };
     game.state = 'sweep';
     Sound.sweep();
   }
@@ -1623,6 +1635,7 @@ const Sound = (function () {
         el.powerFill.style.width = (game.power.value * 100).toFixed(1) + '%';
       }
       cam.y += (-CAM.back - cam.y) * Math.min(1, 6 * dt);
+      cam.x += (0 - cam.x) * Math.min(1, 6 * dt);
     } else if (game.state === 'rolling') {
       let scale = game.timeScale;
       if (game.slowmo > 0) { game.slowmo -= dt; scale *= 0.28; }
@@ -1633,6 +1646,7 @@ const Sound = (function () {
       // cámara: sigue la bola, sin pasar de la zona de pinos
       const target = clamp(b.y - CAM.back, -CAM.back, CAM.maxY);
       cam.y += (target - cam.y) * Math.min(1, 7 * dt);
+      cam.x += (clamp(b.x * 0.4, -0.3, 0.3) - cam.x) * Math.min(1, 5 * dt);
       for (const p of w.pins) if (p.state === 'fallen') p.tilt = Math.min(1, (p.tilt || 0) + dt * scale * 4.5);
       if (w.finished) finishRoll();
     } else if (game.state === 'result') {
@@ -1643,10 +1657,14 @@ const Sound = (function () {
       sw.t += dt;
       const t = sw.t / sw.duration;
       const w = game.world;
+      // La barra recorre la zona de pinos de delante hacia atrás; los pinos desaparecen al pasar
+      sw.barY = lerp(LANE.deckStartY - 0.2, LANE.pitY + 0.1, easeInOut(clamp(t * 1.25, 0, 1)));
       for (const p of w.pins) {
-        if (p.state !== 'standing' || sw.fullRack) p.alpha = 1 - easeOut(t * 1.6);
+        const goes = p.state !== 'standing' || sw.fullRack;
+        if (goes && sw.barY > p.y - 0.15) p.alpha = Math.max(0, (p.alpha == null ? 1 : p.alpha) - dt / Math.max(0.08, sw.duration * 0.25));
       }
       cam.y = lerp(sw.camFrom, -CAM.back, easeInOut(t));
+      cam.x = lerp(sw.camX, 0, easeInOut(t));
       if (t >= 1) endSweep();
     }
   }
@@ -1808,6 +1826,16 @@ const Sound = (function () {
     ctx.restore();
   }
 
+  /** Barra del pinsetter que barre la zona de pinos. */
+  function drawSweepBar(y) {
+    const hw = LANE.halfWidth + 0.02;
+    const a = project(-hw, y, 0.02), b = project(hw, y, 0.02), c = project(hw, y, 0.16), d = project(-hw, y, 0.16);
+    ctx.fillStyle = '#2c3446';
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fillRect(Math.min(a.x, d.x), a.y, Math.abs(b.x - a.x), Math.max(1, a.s * 0.03));
+  }
+
   function drawBall(x, y, z, traveled, hidden) {
     if (hidden) return;
     const r = BALL.radius;
@@ -1850,12 +1878,15 @@ const Sound = (function () {
   /** Trayectoria prevista (sin pinos) para la guía de puntería. */
   function predictPath(x, angle, speed, spin) {
     const pts = [];
-    let px = x, py = 0, vx = Math.sin(angle) * speed, vy = Math.cos(angle) * speed;
+    let px = x, py = 0, vx = Math.sin(angle) * speed, vy = Math.cos(angle) * speed, hooked = 0;
     const dt = 0.03;
+    const reserve = SIM.hookReserve * Math.abs(spin);
     for (let i = 0; i < 400 && py < LANE.deckStartY; i++) {
       const sp = Math.hypot(vx, vy); if (sp < 0.1) break;
-      const ns = Math.max(0, sp - SIM.ballDecel * dt) / sp; vx *= ns; vy *= ns;
-      vx += SIM.hookAccel * spin * P.hookProfile(py) * dt;
+      const prof = P.hookProfile(py);
+      const ns = Math.max(0, sp - (SIM.ballDecel + (SIM.ballDecelDry - SIM.ballDecel) * prof) * dt) / sp; vx *= ns; vy *= ns;
+      const dv = SIM.hookAccel * spin * prof * dt;
+      if (hooked + Math.abs(dv) <= reserve) { vx += dv; hooked += Math.abs(dv); }
       px += vx * dt; py += vy * dt;
       if (Math.abs(px) > LANE.halfWidth + BALL.radius * 0.35) { pts.push({ x: px, y: py, gutter: true }); break; }
       if (i % 3 === 0) pts.push({ x: px, y: py });
@@ -1893,6 +1924,7 @@ const Sound = (function () {
     const b = w.ball;
     if (game.state === 'aim') items.push({ y: 0, draw: () => drawBall(game.aimX, 0, 0, 0, false) });
     else if (b.active && !b.inPit) items.push({ y: b.y, draw: () => drawBall(b.x, b.y, b.inGutter ? -0.06 : 0, b.traveled, false) });
+    if (game.state === 'sweep' && game.sweep && game.sweep.barY != null) items.push({ y: game.sweep.barY, draw: () => drawSweepBar(game.sweep.barY) });
     items.sort((a, c) => c.y - a.y);
     for (const it of items) it.draw();
     if (game.state === 'aim' && !anyOverlayOpen()) drawGuide();
