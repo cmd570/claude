@@ -302,3 +302,64 @@ test('sin WebGL el juego sigue siendo jugable con la vista 2D de emergencia', { 
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('un strike se repite a cámara lenta desde la cámara de los bolos y el pinsetter coloca el rack nuevo', { skip: !chromium && 'Playwright no disponible' }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const { page, errors } = await open(browser, { viewport: { width: 900, height: 600 } });
+    await page.evaluate(() => { window.__bowling.setSeed(5); window.__bowling.start(['Ana']); window.__bowling.pauseLoop(true); });
+    let replayed = false;
+    for (let attempt = 0; attempt < 6 && !replayed; attempt++) {
+      assert.equal(await page.evaluate(() => window.__bowling.throwBall({ x: 0.07, power: 0.8, angle: 0 })), true);
+      for (let i = 0; i < 60; i++) {
+        const st = await page.evaluate(() => { window.__bowling.step(0.25); return window.__bowling.state().state; });
+        if (st === 'replay') { replayed = true; break; }
+        if (st !== 'rolling') break;
+      }
+      if (replayed) break;
+      // Sin strike: se deja terminar la jugada y se vuelve a intentar
+      for (let i = 0; i < 80; i++) { const st = await page.evaluate(() => { window.__bowling.step(0.25); return window.__bowling.state().state; }); if (st === 'aim') break; }
+    }
+    assert.equal(replayed, true, 'un strike entra en el estado de repetición');
+    assert.equal(await page.isVisible('#replay-chip'), true, 'se muestra el rótulo de repetición');
+    const cam = await page.evaluate(() => window.__bowling.renderer().cam.eye);
+    assert.ok(cam[0] < -0.4 && cam[2] > 15, `la cámara de la repetición está en el lateral de la zona de bolos (${cam.map((v) => v.toFixed(2))})`);
+    assert.equal(await page.evaluate(() => window.__bowling.skip()), true, 'se puede saltar la repetición');
+    let st = await page.evaluate(() => window.__bowling.state());
+    assert.equal(st.state, 'result');
+    assert.equal(st.replays, 1);
+    assert.match(await page.textContent('#message'), /STRIKE/);
+    // Ciclo del pinsetter: la mesa baja a colocar los bolos y la barra recorre la zona de bolos hasta el foso
+    let minTable = 9, maxBarZ = 0;
+    for (let i = 0; i < 120; i++) {
+      const s = await page.evaluate(() => { window.__bowling.step(0.1); const m = window.__bowling.machine; return { state: window.__bowling.state().state, table: m.table.y, barZ: m.bar.z }; });
+      if (s.state === 'sweep') { minTable = Math.min(minTable, s.table); maxBarZ = Math.max(maxBarZ, s.barZ); }
+      if (s.state === 'aim') break;
+    }
+    assert.ok(minTable < 0.45, `la mesa baja hasta la plataforma (mín. ${minTable.toFixed(2)} m)`);
+    assert.ok(maxBarZ > 19, `la barra llega al foso (máx. z ${maxBarZ.toFixed(2)} m)`);
+    st = await page.evaluate(() => window.__bowling.state());
+    assert.equal(st.state, 'aim');
+    assert.equal(st.standing.length, 10, 'rack completo tras el strike');
+    assert.equal(await page.isVisible('#replay-chip'), false);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('la repetición se omite en modo rápido, con prisa y con movimiento reducido', { skip: !chromium && 'Playwright no disponible' }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const { page, errors } = await open(browser, { reducedMotion: 'reduce' });
+    await page.evaluate(() => { window.__bowling.setSeed(5); window.__bowling.start(['Ana']); window.__bowling.pauseLoop(true); });
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await page.evaluate(() => window.__bowling.throwBall({ x: 0.07, power: 0.8, angle: 0 }));
+      let states = new Set();
+      for (let i = 0; i < 140; i++) { const st = await page.evaluate(() => { window.__bowling.step(0.25); return window.__bowling.state().state; }); states.add(st); if (st === 'aim') break; }
+      assert.ok(!states.has('replay'), 'sin repetición con prefers-reduced-motion');
+      const st = await page.evaluate(() => window.__bowling.state());
+      if (st.lastRoll && st.lastRoll.isStrike) break;
+    }
+    assert.equal(await page.evaluate(() => window.__bowling.state().replays), 0);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

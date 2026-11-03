@@ -4,8 +4,8 @@
   "description": "Juego de bowling de diez bolos en un único archivo HTML con física, efecto y marcador oficial.",
   "private": true,
   "scripts": {
-    "test": "node --test tests/scoring.test.js tests/physics.test.js tests/e2e.test.js",
-    "test:unit": "node --test tests/scoring.test.js tests/physics.test.js",
+    "test": "node --test tests/scoring.test.js tests/physics.test.js tests/render.test.js tests/e2e.test.js",
+    "test:unit": "node --test tests/scoring.test.js tests/physics.test.js tests/render.test.js",
     "test:e2e": "node --test tests/e2e.test.js"
   },
   "devDependencies": {

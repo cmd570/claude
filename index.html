@@ -115,6 +115,10 @@
   }
   .chip b { color: var(--accent); }
   #hint { max-width: 60%; text-align: right; color: var(--muted); font-size: .78rem; }
+  /* Repetición a cámara lenta */
+  #replay-chip { position: absolute; left: 50%; top: 3.2rem; transform: translateX(-50%); display: flex; align-items: center; gap: .45rem; font-weight: 700; letter-spacing: .12em; font-size: .78rem; color: #fff; border-color: rgba(255, 77, 109, .6); }
+  #replay-chip::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: #ff4d6d; box-shadow: 0 0 8px #ff4d6d; animation: blink 1s steps(2, start) infinite; }
+  @keyframes blink { to { visibility: hidden; } }
 
   /* Control de efecto */
   #spin { display: flex; align-items: center; gap: .4rem; background: rgba(10, 14, 24, .78); border: 1px solid var(--line); border-radius: 999px; padding: .25rem .4rem; }
@@ -204,6 +208,7 @@
   @media (prefers-reduced-motion: reduce) {
     #message.show { animation: pop-still 1.6s linear forwards; }
     .btn { transition: none; }
+    #replay-chip::before { animation: none; }
   }
 </style>
 </head>
@@ -226,6 +231,8 @@
       <div class="chip" id="status"><b>Jugador 1</b> · Cuadro 1 · Tiro 1</div>
       <div class="chip" id="pins-chip">Bolos en pie: <b>10</b></div>
     </div>
+
+    <div class="chip" id="replay-chip" hidden aria-hidden="true">REPETICIÓN · cámara lenta</div>
 
     <div id="power" role="progressbar" aria-label="Potencia" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="power-fill"></div></div>
 
@@ -280,7 +287,8 @@
           <dt><kbd>Espacio</kbd></dt><dd>Arranca el medidor de potencia; pulsa de nuevo para lanzar.</dd>
           <dt><kbd>R</kbd></dt><dd>Repetir el último tiro (misma posición, fuerza y efecto).</dd>
           <dt><kbd>M</kbd></dt><dd>Silenciar / activar sonido.</dd>
-          <dt>Acelerar</dt><dd>Toca la pista o pulsa <kbd>Espacio</kbd> mientras rueda la bola para acelerar, y de nuevo para saltar la recogida.</dd>
+          <dt>Acelerar</dt><dd>Toca la pista o pulsa <kbd>Espacio</kbd> mientras rueda la bola para acelerar, y de nuevo para saltar la repetición o la recogida.</dd>
+          <dt>Repetición</dt><dd>Tras un strike verás la jugada a cámara lenta desde la cámara de los bolos; toca para saltarla.</dd>
           <dt>Consejo</dt><dd>Apunta al «bolsillo» entre el bolo 1 y el 3 (o el 1 y el 2) con buena velocidad para conseguir strikes. A potencia máxima el tiro pierde algo de precisión.</dd>
         </dl>
         <p>Puntuación: strike = 10 + los dos tiros siguientes; spare = 10 + el tiro siguiente. En el cuadro 10 un strike o spare da un tiro extra. Máximo: 300.</p>
@@ -1154,13 +1162,24 @@ if (typeof module !== 'undefined' && module.exports) module.exports = BowlingPhy
 <script id="audio">
 /* ==========================================================================
    Sonido sintetizado con Web Audio (sin archivos externos).
+   - Reverberación de sala (respuesta al impulso sintética, 1,3 s) con más
+     envío para lo que ocurre en la zona de bolos (a 18 m del jugador).
+   - Rodar de la bola: ruido marrón filtrado por velocidad, más hueco en el
+     canal, siseo al llegar a la madera seca.
+   - Bolos: crack de la bola (1-4 kHz) sobre un golpe de cuerpo, clacks de
+     madera entre bolos, thocks en los kickbacks, golpes sordos en el foso.
+   - Pinsetter: clank de la barra, zumbido del motor y cadena de la mesa.
+   - Retorno de bola y ambiente de sala.
    ========================================================================== */
 const Sound = (function () {
   'use strict';
-  let ctx = null, master = null, noiseBuf = null, panner = null;
+  let ctx = null, master = null, noiseBuf = null, panner = null, reverb = null, reverbSend = null, dry = null;
   let enabled = true;
   let roll = null;           // nodos del rodar de la bola
-  let lastHit = 0;
+  let machineNodes = null;   // zumbido del pinsetter
+  let ambience = null;
+  let lastHit = 0, lastClack = 0;
+  const DECK_DELAY = 0.05;   // la zona de bolos está a 18 m: el sonido llega 50 ms tarde
 
   function init() {
     if (ctx) return true;
@@ -1170,17 +1189,36 @@ const Sound = (function () {
       ctx = new AC();
     } catch (e) { return false; }
     const comp = ctx.createDynamicsCompressor();
-    comp.threshold.value = -18; comp.knee.value = 20; comp.ratio.value = 8; comp.attack.value = 0.003; comp.release.value = 0.2;
+    comp.threshold.value = -16; comp.knee.value = 18; comp.ratio.value = 6; comp.attack.value = 0.003; comp.release.value = 0.25;
     master = ctx.createGain();
     master.gain.value = enabled ? 0.9 : 0;
+    dry = ctx.createGain(); dry.gain.value = 1;
+    dry.connect(master);
     // Paneo estéreo según la posición lateral de la bola (si el navegador lo soporta)
-    if (ctx.createStereoPanner) { panner = ctx.createStereoPanner(); panner.connect(master); }
+    if (ctx.createStereoPanner) { panner = ctx.createStereoPanner(); panner.connect(dry); }
     master.connect(comp); comp.connect(ctx.destination);
     // Ruido blanco de 2 s reutilizable
     const len = ctx.sampleRate * 2;
     noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
     const d = noiseBuf.getChannelData(0);
     for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    // Reverberación: respuesta al impulso sintética (ruido estéreo con caída exponencial y predelay)
+    try {
+      const rlen = Math.floor(ctx.sampleRate * 1.3);
+      const ir = ctx.createBuffer(2, rlen, ctx.sampleRate);
+      for (let c = 0; c < 2; c++) {
+        const ch = ir.getChannelData(c);
+        const pre = Math.floor(ctx.sampleRate * 0.04);
+        for (let i = pre; i < rlen; i++) {
+          const t = (i - pre) / ctx.sampleRate;
+          ch[i] = (Math.random() * 2 - 1) * Math.exp(-t * 4.2) * (1 - Math.exp(-t * 120));
+        }
+      }
+      reverb = ctx.createConvolver(); reverb.buffer = ir;
+      const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3200;
+      reverbSend = ctx.createGain(); reverbSend.gain.value = 0.22;
+      reverbSend.connect(reverb); reverb.connect(lp); lp.connect(master);
+    } catch (e) { reverb = null; reverbSend = null; }
     return true;
   }
 
@@ -1188,17 +1226,23 @@ const Sound = (function () {
   function unlock() {
     if (!init()) return;
     if (ctx.state !== 'running') { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+    startAmbience();
   }
   /** iOS deja el contexto en «interrupted» tras una llamada o bloqueo: intentar reanudar. */
   function resumeIfNeeded() {
     if (ctx && ctx.state !== 'running' && ctx.state !== 'closed') { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
   }
-  const out = () => panner || master;
+  const out = () => panner || dry;
+  /** Conecta un nodo a la salida seca y al envío de reverberación (wet relativo). */
+  function connectOut(node, wet, panned) {
+    node.connect(panned ? out() : dry);
+    if (reverbSend && wet > 0) { const g = ctx.createGain(); g.gain.value = wet; node.connect(g); g.connect(reverbSend); }
+  }
 
   function setEnabled(v) {
     enabled = !!v;
     if (master) master.gain.setTargetAtTime(enabled ? 0.9 : 0, ctx.currentTime, 0.02);
-    if (!enabled) rollStop();
+    if (!enabled) { rollStop(); machineStop(); }
   }
   function isEnabled() { return enabled; }
   function ready() { return !!ctx && enabled && ctx.state === 'running'; }
@@ -1209,67 +1253,129 @@ const Sound = (function () {
     src.loopStart = 0; src.loopEnd = noiseBuf.duration;
     return src;
   }
-
   function env(gain, t, peak, attack, decay) {
     gain.gain.cancelScheduledValues(t);
     gain.gain.setValueAtTime(0.0001, t);
     gain.gain.linearRampToValueAtTime(peak, t + attack);
     gain.gain.exponentialRampToValueAtTime(0.0001, t + attack + decay);
   }
-
-  /** Choque de bolos: ráfaga de ruido con filtro pasabanda + golpe de madera. */
-  function pinHit(impact, byBall) {
-    if (!ready()) return;
-    const now = ctx.currentTime;
-    if (now - lastHit < 0.03) return;   // evita saturar con muchos choques simultáneos
-    lastHit = now;
-    const k = Math.min(1, impact / 5);
-    const g = ctx.createGain();
+  /** Ráfaga de ruido filtrada (pasabanda) con envolvente. */
+  function burst(t, freq, Q, peak, attack, decay, wet, type) {
     const n = noiseSource();
-    const bp = ctx.createBiquadFilter();
-    bp.type = 'bandpass'; bp.frequency.value = byBall ? 1600 + 1400 * k : 2600 + 1800 * Math.random(); bp.Q.value = 1.2;
-    n.connect(bp); bp.connect(g); g.connect(out());
-    env(g, now, 0.25 + 0.55 * k, 0.003, 0.07 + 0.06 * k);
-    n.start(now); n.stop(now + 0.25);
-    // golpe seco
+    const f = ctx.createBiquadFilter(); f.type = type || 'bandpass'; f.frequency.value = freq; f.Q.value = Q;
+    const g = ctx.createGain();
+    n.connect(f); f.connect(g); connectOut(g, wet == null ? 0.6 : wet, true);
+    env(g, t, peak, attack, decay);
+    n.start(t); n.stop(t + attack + decay + 0.05);
+  }
+  /** Tono con barrido de frecuencia (golpe de cuerpo). */
+  function knock(t, f0, f1, dur, peak, type, wet) {
     const o = ctx.createOscillator();
-    const og = ctx.createGain();
-    o.type = 'triangle';
-    o.frequency.setValueAtTime(byBall ? 420 : 760 + Math.random() * 180, now);
-    o.frequency.exponentialRampToValueAtTime(byBall ? 120 : 300, now + 0.08);
-    o.connect(og); og.connect(out());
-    env(og, now, 0.15 + 0.3 * k, 0.002, 0.09);
-    o.start(now); o.stop(now + 0.15);
+    const g = ctx.createGain();
+    o.type = type || 'triangle';
+    o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+    o.connect(g); connectOut(g, wet == null ? 0.5 : wet, true);
+    env(g, t, peak, 0.002, dur);
+    o.start(t); o.stop(t + dur + 0.05);
   }
 
-  /** Rodar de la bola: ruido marrón filtrado cuya intensidad sigue la velocidad. */
+  /** Choque de bolos: crack de la bola sobre un golpe de cuerpo; entre bolos, clacks de madera. */
+  function pinHit(impact, byBall) {
+    if (!ready()) return;
+    const now = ctx.currentTime + DECK_DELAY;
+    const k = Math.min(1, impact / 5);
+    if (byBall) {
+      if (now - lastHit < 0.03) return;
+      lastHit = now;
+      burst(now, 1800 + 1600 * k, 1.1, 0.35 + 0.6 * k, 0.002, 0.05 + 0.05 * k, 0.7);   // crack
+      knock(now, 230, 70, 0.12 + 0.08 * k, 0.25 + 0.35 * k, 'triangle', 0.5);          // cuerpo del bolo
+      knock(now, 90, 45, 0.18, 0.2 * k, 'sine', 0.3);                                    // golpe de la bola
+    } else {
+      if (now - lastClack < 0.022) return;
+      lastClack = now;
+      burst(now, 1900 + Math.random() * 1700, 7, 0.14 + 0.4 * k, 0.002, 0.035 + 0.04 * k, 0.7);  // clack de madera
+      knock(now, 520 + Math.random() * 200, 240, 0.06, 0.1 + 0.15 * k, 'triangle', 0.5);
+    }
+  }
+  /** Bolo que cae sobre la plataforma: golpe hueco de madera con doble rebote. */
+  function pinFloor(impact) {
+    if (!ready()) return;
+    const now = ctx.currentTime + DECK_DELAY;
+    if (now - lastClack < 0.03) return;
+    lastClack = now;
+    const k = Math.min(1, impact / 3);
+    knock(now, 320 + Math.random() * 90, 140, 0.11, 0.12 + 0.2 * k, 'triangle', 0.6);
+    burst(now, 900, 2, 0.08 + 0.12 * k, 0.003, 0.06, 0.6);
+  }
+  /** Golpe sordo: bola en el foso (o bolo en el kickback si isPin). */
+  function thud(strength, isPin) {
+    if (!ready()) return;
+    const t = ctx.currentTime + DECK_DELAY;
+    const s = Math.min(1, strength || 1);
+    if (isPin) {
+      burst(t, 750 + Math.random() * 250, 3, 0.25 * s, 0.002, 0.06, 0.6);                  // thock en la placa fenólica
+      knock(t, 180, 90, 0.08, 0.12 * s, 'triangle', 0.5);
+      return;
+    }
+    knock(t, 140, 45, 0.3, 0.4 * s, 'sine', 0.5);
+    burst(t, 500, 0.7, 0.25 * s, 0.005, 0.12, 0.6, 'lowpass');
+  }
+  /** Bolo que cae al foso: goma del cojín y cinta. */
+  function pitThud(s) {
+    if (!ready()) return;
+    const t = ctx.currentTime + DECK_DELAY;
+    knock(t, 150, 60, 0.14, 0.22 * s, 'sine', 0.7);
+    burst(t + 0.05 + Math.random() * 0.08, 1400, 5, 0.06, 0.002, 0.03, 0.7);
+  }
+
+  /** Rodar de la bola: ruido marrón filtrado cuya intensidad sigue la velocidad; siseo en la madera seca. */
   function rollStart() {
     if (!ready() || roll) return;
     const n = noiseSource();
     const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass'; lp.frequency.value = 180; lp.Q.value = 0.7;
+    lp.type = 'lowpass'; lp.frequency.value = 180; lp.Q.value = 1.2;
     const lp2 = ctx.createBiquadFilter();
-    lp2.type = 'lowpass'; lp2.frequency.value = 400;
+    lp2.type = 'lowpass'; lp2.frequency.value = 420;
+    const body = ctx.createBiquadFilter();
+    body.type = 'peaking'; body.frequency.value = 140; body.Q.value = 1.5; body.gain.value = 6;   // resonancia del lecho de la pista
     const g = ctx.createGain();
     g.gain.value = 0.0001;
-    n.connect(lp); lp.connect(lp2); lp2.connect(g); g.connect(out());
-    n.start();
-    roll = { n, g, lp };
+    n.connect(lp); lp.connect(lp2); lp2.connect(body); body.connect(g); connectOut(g, 0.25, true);
+    // Siseo de fricción (madera seca / gancho)
+    const n2 = noiseSource();
+    const hp = ctx.createBiquadFilter(); hp.type = 'bandpass'; hp.frequency.value = 3500; hp.Q.value = 0.8;
+    const g2 = ctx.createGain(); g2.gain.value = 0.0001;
+    n2.connect(hp); hp.connect(g2); connectOut(g2, 0.3, true);
+    n.start(); n2.start();
+    roll = { n, g, lp, n2, g2 };
   }
-  function rollUpdate(speed, inGutter, lateral) {
+  function rollUpdate(speed, inGutter, lateral, z) {
     if (!roll) return;
     const t = ctx.currentTime;
     if (panner && typeof lateral === 'number') panner.pan.setTargetAtTime(Math.max(-0.7, Math.min(0.7, lateral * 0.6)), t, 0.08);
     const k = Math.min(1, speed / 9);
-    roll.g.gain.setTargetAtTime(k * (inGutter ? 0.5 : 0.35), t, 0.05);
-    roll.lp.frequency.setTargetAtTime(120 + 260 * k + (inGutter ? 120 : 0), t, 0.05);
+    const far = typeof z === 'number' ? Math.max(0.35, 1 - z / 26) : 1;          // se aleja del jugador
+    roll.g.gain.setTargetAtTime(k * k * (inGutter ? 0.55 : 0.4) * far, t, 0.05);
+    roll.lp.frequency.setTargetAtTime(90 + 300 * k + (inGutter ? 180 : 0), t, 0.05);
+    const dry = typeof z === 'number' ? Math.max(0, Math.min(1, (z - 12.2) / 2)) : 0;
+    roll.g2.gain.setTargetAtTime(k * dry * (inGutter ? 0.03 : 0.045) * far, t, 0.08);
   }
   function rollStop() {
     if (!roll) return;
     const r = roll; roll = null;
     const t = ctx.currentTime;
     r.g.gain.setTargetAtTime(0.0001, t, 0.08);
-    try { r.n.stop(t + 0.5); } catch (e) { /* ya detenido */ }
+    r.g2.gain.setTargetAtTime(0.0001, t, 0.08);
+    try { r.n.stop(t + 0.5); r.n2.stop(t + 0.5); } catch (e) { /* ya detenido */ }
+  }
+  /** Suelta de la bola sobre la pista: golpe grave corto. */
+  function release(speed) {
+    if (!ready()) return;
+    const t = ctx.currentTime;
+    const k = Math.min(1, (speed || 7) / 9.6);
+    knock(t, 70, 42, 0.14, 0.22 + 0.2 * k, 'sine', 0.2);
+    burst(t, 800, 1.5, 0.05 + 0.08 * k, 0.002, 0.02, 0.3);
   }
 
   function tone(freq, t, dur, type, peak) {
@@ -1277,72 +1383,111 @@ const Sound = (function () {
     const g = ctx.createGain();
     o.type = type || 'triangle';
     o.frequency.value = freq;
-    o.connect(g); g.connect(master);
+    o.connect(g); connectOut(g, 0.3, false);
     env(g, t, peak || 0.25, 0.01, dur);
     o.start(t); o.stop(t + dur + 0.05);
   }
-
   function strike() {
     if (!ready()) return;
     const t = ctx.currentTime;
-    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, t + i * 0.09, 0.35, 'triangle', 0.22));
-    [1046.5, 1318.5, 1568].forEach((f, i) => tone(f, t + 0.4 + i * 0.07, 0.5, 'sine', 0.12));
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, t + i * 0.09, 0.35, 'triangle', 0.2));
+    [1046.5, 1318.5, 1568].forEach((f, i) => tone(f, t + 0.4 + i * 0.07, 0.5, 'sine', 0.11));
   }
   function spare() {
     if (!ready()) return;
     const t = ctx.currentTime;
-    tone(659.25, t, 0.25, 'triangle', 0.2);
-    tone(987.77, t + 0.13, 0.45, 'triangle', 0.2);
+    tone(659.25, t, 0.25, 'triangle', 0.18);
+    tone(987.77, t + 0.13, 0.45, 'triangle', 0.18);
   }
+  /** Caída al canal: «clonk» hueco de PVC y traqueteo. */
   function gutter() {
     if (!ready()) return;
     const t = ctx.currentTime;
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.type = 'sawtooth';
-    o.frequency.setValueAtTime(260, t);
-    o.frequency.exponentialRampToValueAtTime(90, t + 0.45);
-    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 600;
-    o.connect(lp); lp.connect(g); g.connect(master);
-    env(g, t, 0.2, 0.01, 0.45);
-    o.start(t); o.stop(t + 0.5);
-  }
-  function thud(strength) {
-    if (!ready()) return;
-    const t = ctx.currentTime;
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.type = 'sine';
-    o.frequency.setValueAtTime(140, t);
-    o.frequency.exponentialRampToValueAtTime(45, t + 0.25);
-    o.connect(g); g.connect(master);
-    env(g, t, 0.35 * Math.min(1, strength || 1), 0.005, 0.3);
-    o.start(t); o.stop(t + 0.35);
-    const n = noiseSource();
-    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 500;
-    const ng = ctx.createGain();
-    n.connect(lp); lp.connect(ng); ng.connect(master);
-    env(ng, t, 0.2, 0.005, 0.12);
-    n.start(t); n.stop(t + 0.2);
+    knock(t, 420, 160, 0.07, 0.3, 'triangle', 0.3);
+    burst(t, 380, 4, 0.2, 0.002, 0.08, 0.4);
+    for (let i = 0; i < 5; i++) burst(t + 0.08 + i * 0.045 + Math.random() * 0.03, 1500 + Math.random() * 1500, 6, 0.05, 0.002, 0.015, 0.3);
   }
   function click() {
     if (!ready()) return;
     tone(880, ctx.currentTime, 0.06, 'square', 0.05);
   }
-  function sweep() {
+
+  /** La barra del pinsetter cae a la posición de guarda: clank metálico. */
+  function sweepDrop() {
     if (!ready()) return;
+    const t = ctx.currentTime + DECK_DELAY + 0.1;
+    burst(t, 2200, 9, 0.18, 0.002, 0.12, 0.8);
+    knock(t, 900, 300, 0.1, 0.12, 'square', 0.6);
+    knock(t + 0.01, 120, 60, 0.12, 0.15, 'sine', 0.5);
+  }
+  function machineStop() {
+    if (!machineNodes) return;
+    const m = machineNodes; machineNodes = null;
     const t = ctx.currentTime;
+    m.g.gain.setTargetAtTime(0.0001, t, 0.1);
+    try { m.o1.stop(t + 0.5); m.o2.stop(t + 0.5); m.n.stop(t + 0.5); } catch (e) { /* ya detenido */ }
+  }
+  /** Ciclo del pinsetter: zumbido del motor, cadena de la mesa y barrido con los bolos cayendo al foso. */
+  function pinsetterStart(duration) {
+    if (!ready()) return;
+    machineStop();
+    const t0 = ctx.currentTime + DECK_DELAY;
+    const o1 = ctx.createOscillator(), o2 = ctx.createOscillator();
+    o1.type = 'sawtooth'; o1.frequency.value = 100; o2.type = 'sine'; o2.frequency.value = 200;
     const n = noiseSource();
-    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.8;
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 400; bp.Q.value = 1.2;   // cadena / cam
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 260;
+    const g = ctx.createGain(); g.gain.value = 0.0001;
+    const gn = ctx.createGain(); gn.gain.value = 0.35;
+    o1.connect(lp); o2.connect(lp); lp.connect(g); n.connect(bp); bp.connect(gn); gn.connect(g);
+    connectOut(g, 0.6, false);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.linearRampToValueAtTime(0.07, t0 + 0.25);
+    g.gain.setValueAtTime(0.07, t0 + Math.max(0.3, duration - 0.3));
+    g.gain.linearRampToValueAtTime(0.0001, t0 + Math.max(0.5, duration + 0.4));
+    o1.start(t0); o2.start(t0); n.start(t0);
+    const stopAt = t0 + duration + 0.6;
+    o1.stop(stopAt); o2.stop(stopAt); n.stop(stopAt);
+    machineNodes = { o1, o2, n, g };
+    // Clunks al final de cada movimiento de la mesa y de la barra
+    for (const dt of [0.7, 1.25, 2.05, 2.75]) if (dt < duration) knock(t0 + dt, 300, 110, 0.07, 0.1, 'square', 0.6);
+  }
+  /** La bola vuelve por el retorno: thunk al salir, rodadura metálica y choque con las otras bolas. */
+  function ballReturn() {
+    if (!ready()) return;
+    const t = ctx.currentTime + 0.3;
+    knock(t, 260, 90, 0.12, 0.22, 'triangle', 0.4);
+    burst(t, 700, 1.2, 0.1, 0.004, 0.08, 0.4, 'lowpass');
+    const n = noiseSource();
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 260; bp.Q.value = 1.4;
     const g = ctx.createGain();
-    n.connect(bp); bp.connect(g); g.connect(master);
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(0.08, t + 0.15);
-    g.gain.linearRampToValueAtTime(0.0001, t + 0.6);
-    n.start(t); n.stop(t + 0.65);
+    n.connect(bp); bp.connect(g); connectOut(g, 0.3, false);
+    g.gain.setValueAtTime(0.0001, t + 0.1);
+    g.gain.linearRampToValueAtTime(0.09, t + 0.35);
+    g.gain.linearRampToValueAtTime(0.0001, t + 0.9);
+    n.start(t + 0.1); n.stop(t + 1.0);
+    burst(t + 0.92, 2600, 8, 0.12, 0.001, 0.025, 0.4);   // clic bola contra bola
+  }
+  /** Ambiente de sala: zumbido grave muy tenue con strikes lejanos de otras pistas. */
+  function startAmbience() {
+    if (!ready() || ambience) return;
+    const n = noiseSource();
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 120;
+    const g = ctx.createGain(); g.gain.value = 0.018;
+    n.connect(lp); lp.connect(g); g.connect(master);
+    n.start();
+    const timer = setInterval(() => {
+      if (!ready()) return;
+      if (Math.random() < 0.35) {
+        const t = ctx.currentTime + Math.random() * 2;
+        for (let i = 0; i < 7; i++) burst(t + i * 0.05 + Math.random() * 0.06, 1800 + Math.random() * 1500, 6, 0.02, 0.002, 0.03, 2.5);
+        knock(t, 180, 70, 0.15, 0.03, 'triangle', 2.0);
+      }
+    }, 9000);
+    ambience = { n, g, timer };
   }
 
-  return { unlock, resumeIfNeeded, setEnabled, isEnabled, pinHit, rollStart, rollUpdate, rollStop, strike, spare, gutter, thud, click, sweep };
+  return { unlock, resumeIfNeeded, setEnabled, isEnabled, pinHit, pinFloor, pitThud, rollStart, rollUpdate, rollStop, release, strike, spare, gutter, thud, click, sweepDrop, pinsetterStart, machineStop, ballReturn };
 })();
 </script>
 <script id="gl">
@@ -1387,6 +1532,9 @@ const GLCore = (function () {
       ]);
     },
     translation(x, y, z) { const o = M4.identity(); o[12] = x; o[13] = y; o[14] = z; return o; },
+    rotationX(a) { const c = Math.cos(a), s = Math.sin(a); const o = M4.identity(); o[5] = c; o[6] = s; o[9] = -s; o[10] = c; return o; },
+    rotationY(a) { const c = Math.cos(a), s = Math.sin(a); const o = M4.identity(); o[0] = c; o[2] = -s; o[8] = s; o[10] = c; return o; },
+    rotationZ(a) { const c = Math.cos(a), s = Math.sin(a); const o = M4.identity(); o[0] = c; o[1] = s; o[4] = -s; o[5] = c; return o; },
     scaling(x, y, z) { const o = M4.identity(); o[0] = x; o[5] = y; o[10] = z; return o; },
     /** Matriz de modelo a partir de posición y cuaternión [x, y, z, w] (y escala opcional). */
     fromQuat(p, q, s) {
@@ -1481,7 +1629,7 @@ const GLCore = (function () {
   }
   function drawMesh(gl, mesh) { gl.drawElements(gl.TRIANGLES, mesh.count, mesh.type, 0); }
 
-  /** Sólido de revolución alrededor del eje y a partir de un perfil [(y, radio)...]. */
+  /** Sólido de revolución alrededor del eje y a partir de un perfil [(y, radio[, v])...]; v opcional = coordenada de textura. */
   function lathe(profile, segments) {
     const data = [], idx = [];
     const n = profile.length;
@@ -1494,7 +1642,7 @@ const GLCore = (function () {
     });
     for (let i = 0; i < n; i++) {
       const [y, r] = profile[i];
-      const v = i / (n - 1);
+      const v = profile[i].length > 2 ? profile[i][2] : i / (n - 1);
       for (let s = 0; s <= segments; s++) {
         const a = (s / segments) * Math.PI * 2;
         const c = Math.cos(a), sn = Math.sin(a);
@@ -1573,6 +1721,25 @@ const GLCore = (function () {
       idx.push(a, b, a + 1, a + 1, b, b + 1);
     }
     return { data, idx };
+  }
+  /** Cilindro cerrado de radio r entre y0 e y1 (eje y). */
+  function cylinder(r, y0, y1, seg) {
+    const side = lathe([[y0, r, 0], [y1, r, 1]], seg);
+    const data = side.data.slice(), idx = side.idx.slice();
+    for (const [y, ny] of [[y1, 1], [y0, -1]]) {
+      const base = data.length / 8;
+      data.push(0, y, 0, 0, ny, 0, 0.5, 0.5);
+      for (let s = 0; s <= seg; s++) {
+        const a = (s / seg) * Math.PI * 2;
+        data.push(Math.cos(a) * r, y, Math.sin(a) * r, 0, ny, 0, 0.5 + 0.5 * Math.cos(a), 0.5 + 0.5 * Math.sin(a));
+      }
+      for (let s = 0; s < seg; s++) { if (ny > 0) idx.push(base, base + 1 + s, base + 2 + s); else idx.push(base, base + 2 + s, base + 1 + s); }
+    }
+    return { data, idx };
+  }
+  /** Cuadrado unitario en el plano y = 0 (x, z de -1 a 1) con uv de 0 a 1 y normal hacia arriba. */
+  function quadXZ() {
+    return { data: [-1, 0, -1, 0, 1, 0, 0, 0, 1, 0, -1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, -1, 0, 1, 0, 1, 0, 0, 1], idx: [0, 1, 2, 0, 2, 3] };
   }
   function merge(parts) {
     const data = [], idx = [];
@@ -1677,11 +1844,39 @@ const GLCore = (function () {
     return { noise2, fbm };
   }
 
-  return { M4, program, createMesh, bindMesh, drawMesh, lathe, sphere, box, plane, trough, merge, transform, texture2D, renderTarget, resizeTarget, makeNoise, vec: { sub3, cross3, dot3, norm3 } };
+  /** Interpolación cúbica monótona (PCHIP, Fritsch-Carlson) de los puntos (xs, ys). */
+  function pchip(xs, ys) {
+    const n = xs.length;
+    const h = [], d = [];
+    for (let i = 0; i < n - 1; i++) { h.push(xs[i + 1] - xs[i]); d.push((ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i])); }
+    const m = new Array(n).fill(0);
+    m[0] = d[0]; m[n - 1] = d[n - 2];
+    for (let i = 1; i < n - 1; i++) {
+      if (d[i - 1] * d[i] <= 0) { m[i] = 0; continue; }
+      const w1 = 2 * h[i] + h[i - 1], w2 = h[i] + 2 * h[i - 1];
+      m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]);
+    }
+    return function (x) {
+      if (x <= xs[0]) return ys[0];
+      if (x >= xs[n - 1]) return ys[n - 1];
+      let i = 0; while (i < n - 2 && x > xs[i + 1]) i++;
+      const t = (x - xs[i]) / h[i], t2 = t * t, t3 = t2 * t;
+      return (2 * t3 - 3 * t2 + 1) * ys[i] + (t3 - 2 * t2 + t) * h[i] * m[i] + (-2 * t3 + 3 * t2) * ys[i + 1] + (t3 - t2) * h[i] * m[i + 1];
+    };
+  }
+
+  return { M4, program, createMesh, bindMesh, drawMesh, lathe, sphere, box, plane, trough, cylinder, quadXZ, merge, transform, texture2D, renderTarget, resizeTarget, makeNoise, pchip, vec: { sub3, cross3, dot3, norm3 } };
 })();
 /* ==========================================================================
    Renderizador WebGL de la pista (iluminación física, sombras, reflejos).
-   Parte A: shaders, materiales procedurales y construcción de la escena.
+   Parte A: shaders, materiales procedurales, perfil USBC del bolo y texturas.
+   - Luces lineales (tubos del techo y foco del pin deck) con el método del
+     punto representativo (Karis, 2013) para reflejos alargados reales.
+   - Aceite de la pista: patrón de casa (longitud + perfil transversal) que
+     modula la rugosidad; huellas de bola más allá del aceite.
+   - Madera: arce en cabeceras y zona de bolos, pino en el centro, juntas a
+     tope por tabla; pin deck sintético oscuro con marcas blancas.
+   - Bloom (canal alfa = brillo sobre blanco), FXAA ligero, grano y viñeta.
    ========================================================================== */
 const BowlingRenderer = (function () {
   'use strict';
@@ -1703,7 +1898,7 @@ const BowlingRenderer = (function () {
       gl_Position = uProj * uView * wp;
     }`;
 
-  // Iluminación: GGX + Schlick + Lambert, luz principal con sombra, luz de relleno, hemisferio.
+  // Iluminación: GGX + Schlick + Lambert; luz principal con sombra (PCF Poisson), relleno, hemisferio y 3 luces lineales.
   const FS_COMMON = `
     precision highp float;
     varying vec3 vPos; varying vec3 vNrm; varying vec2 vUv; varying vec4 vShadow; varying float vClip;
@@ -1712,7 +1907,8 @@ const BowlingRenderer = (function () {
     uniform vec3 uLightColor;
     uniform vec3 uFillDir; uniform vec3 uFillColor;
     uniform vec3 uSkyColor; uniform vec3 uGroundColor;
-    uniform vec3 uDeckLightPos; uniform vec3 uDeckLightColor;   // foco sobre los bolos (caída inversa al cuadrado)
+    uniform vec3 uTubeA[2]; uniform vec3 uTubeB[2]; uniform vec3 uTubeColor[2]; uniform float uTubeRadius[2];   // 0: fila de luminarias sobre la pista, 1: foco del pin deck
+    uniform float uPcf;
     uniform sampler2D uShadowMap; uniform float uShadowTexel; uniform float uShadowOn;
     uniform float uExposure;
     const float PI = 3.14159265;
@@ -1723,63 +1919,87 @@ const BowlingRenderer = (function () {
       vec3 sc = vShadow.xyz / vShadow.w * 0.5 + 0.5;
       if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0 || sc.z > 1.0) return 1.0;
       float ndl = max(dot(n, uLightDir), 0.0);
-      float bias = mix(0.0025, 0.0005, ndl);
-      float s = 0.0;
-      for (int x = -1; x <= 1; x++) for (int y = -1; y <= 1; y++) {
-        float d = unpack(texture2D(uShadowMap, sc.xy + vec2(float(x), float(y)) * uShadowTexel));
+      float bias = mix(0.0025, 0.0006, ndl);
+      if (uPcf < 0.5) return (sc.z - bias) > unpack(texture2D(uShadowMap, sc.xy)) ? 0.0 : 1.0;
+      // Disco de Poisson girado por píxel (ruido de gradiente entrelazado): penumbra suave sin bandas
+      float ang = 6.2831853 * fract(52.9829189 * fract(0.06711056 * gl_FragCoord.x + 0.00583715 * gl_FragCoord.y));
+      float cs = cos(ang), sn = sin(ang);
+      mat2 rot = mat2(cs, sn, -sn, cs);
+      vec2 taps[4];
+      taps[0] = vec2(-0.7, 0.55); taps[1] = vec2(0.72, 0.5); taps[2] = vec2(-0.5, -0.75); taps[3] = vec2(0.6, -0.6);
+      float s = (sc.z - bias) > unpack(texture2D(uShadowMap, sc.xy)) ? 0.0 : 1.0;
+      for (int i = 0; i < 4; i++) {
+        vec2 o = rot * taps[i] * uShadowTexel * 1.7;
+        float d = unpack(texture2D(uShadowMap, sc.xy + o));
         s += (sc.z - bias) > d ? 0.0 : 1.0;
       }
-      return s / 9.0;
+      return s / 5.0;
     }
     float D_GGX(float NoH, float a) { float a2 = a * a; float d = NoH * NoH * (a2 - 1.0) + 1.0; return a2 / (PI * d * d + 1e-6); }
     float V_Smith(float NoV, float NoL, float a) { float k = a * 0.5; return 1.0 / ((NoV * (1.0 - k) + k) * (NoL * (1.0 - k) + k) + 1e-5); }
     vec3 F_Schlick(float VoH, vec3 f0) { float f = pow(1.0 - VoH, 5.0); return f0 + (1.0 - f0) * f; }
+    float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+    vec3 directional(vec3 l, vec3 color, vec3 n, vec3 v, vec3 diff, vec3 f0, float a) {
+      vec3 h = normalize(l + v);
+      float NoL = max(dot(n, l), 0.0), NoV = max(dot(n, v), 1e-4), NoH = max(dot(n, h), 0.0), VoH = max(dot(v, h), 0.0);
+      vec3 F = F_Schlick(VoH, f0);
+      vec3 spec = D_GGX(NoH, a) * V_Smith(NoV, NoL, a) * F / 4.0;
+      return (diff / PI * (1.0 - F) + spec) * color * NoL;
+    }
+    // Luz lineal (tubo) entre A y B de radio r y radiancia L: punto representativo (Karis 2013) para el especular,
+    // punto más cercano para la difusa (E ≈ π·L·r/d para una tira larga). Un espejo refleja F·L, como el emisor dibujado.
+    vec3 tube(vec3 A, vec3 B, vec3 L, float r, vec3 n, vec3 v, vec3 p, vec3 diff, vec3 f0, float a) {
+      vec3 L0 = A - p, L1 = B - p, Ld = L1 - L0;
+      // Difusa: punto del segmento más cercano al punto sombreado
+      float td = clamp(-dot(L0, Ld) / max(dot(Ld, Ld), 1e-4), 0.0, 1.0);
+      vec3 cd = L0 + Ld * td;
+      float dd = max(length(cd), 0.15);
+      vec3 ld = cd / dd;
+      float NoLd = max(dot(n, ld), 0.0);
+      float cone = smoothstep(-0.05, 0.45, ld.y);                      // luminaria encastrada: solo ilumina hacia abajo
+      vec3 Fd = F_Schlick(max(dot(n, v), 0.0), f0);
+      vec3 col = diff / PI * (1.0 - Fd) * (PI * r / dd) * NoLd * cone * L;
+      vec3 rv = reflect(-v, n);
+      float RoLd = dot(rv, Ld);
+      float denom = max(dot(Ld, Ld) - RoLd * RoLd, 1e-4);
+      float t = clamp((dot(rv, L0) * RoLd - dot(L0, Ld)) / denom, 0.0, 1.0);
+      vec3 cl = L0 + Ld * t;
+      vec3 ctr = dot(cl, rv) * rv - cl;
+      cl += ctr * clamp(r / max(length(ctr), 1e-4), 0.0, 1.0);
+      float d2 = max(dot(cl, cl), 0.01);
+      float dist = sqrt(d2);
+      vec3 l = cl / dist;
+      vec3 h = normalize(l + v);
+      float NoL = max(dot(n, l), 0.0), NoV = max(dot(n, v), 1e-4), NoH = max(dot(n, h), 0.0), VoH = max(dot(v, h), 0.0);
+      float ap = clamp(a + r / (2.0 * dist), 0.0, 1.0);
+      float norm = (a / ap) * (a / ap);
+      vec3 F = F_Schlick(VoH, f0);
+      vec3 spec = D_GGX(NoH, a) * V_Smith(NoV, NoL, a) * F / 4.0 * norm * (PI * r * r) / d2 * NoL;
+      return col + spec * smoothstep(-0.05, 0.45, l.y) * L;
+    }
 
     vec3 shade(vec3 albedo, float rough, float metal, vec3 n, vec3 p, float ao, float shadow) {
       vec3 v = normalize(uCamPos - p);
       float a = max(rough * rough, 0.002);
       vec3 f0 = mix(vec3(0.04), albedo, metal);
       vec3 diff = albedo * (1.0 - metal);
-      vec3 col = vec3(0.0);
-      // Luz principal
-      {
-        vec3 l = uLightDir; vec3 h = normalize(l + v);
-        float NoL = max(dot(n, l), 0.0), NoV = max(dot(n, v), 1e-4), NoH = max(dot(n, h), 0.0), VoH = max(dot(v, h), 0.0);
-        vec3 F = F_Schlick(VoH, f0);
-        vec3 spec = D_GGX(NoH, a) * V_Smith(NoV, NoL, a) * F / 4.0;
-        col += (diff / PI * (1.0 - F) + spec) * uLightColor * NoL * shadow;
-      }
-      // Luz de relleno (sin sombra)
-      {
-        vec3 l = uFillDir; vec3 h = normalize(l + v);
-        float NoL = max(dot(n, l), 0.0), NoV = max(dot(n, v), 1e-4), NoH = max(dot(n, h), 0.0), VoH = max(dot(v, h), 0.0);
-        vec3 F = F_Schlick(VoH, f0);
-        vec3 spec = D_GGX(NoH, max(a, 0.08)) * V_Smith(NoV, NoL, max(a, 0.08)) * F / 4.0;
-        col += (diff / PI * (1.0 - F) + spec) * uFillColor * NoL;
-      }
-      // Foco del pin deck (luz puntual)
-      {
-        vec3 dl = uDeckLightPos - p;
-        float dist2 = max(dot(dl, dl), 0.05);
-        vec3 l = dl * inversesqrt(dist2);
-        vec3 h = normalize(l + v);
-        float NoL = max(dot(n, l), 0.0), NoV = max(dot(n, v), 1e-4), NoH = max(dot(n, h), 0.0), VoH = max(dot(v, h), 0.0);
-        vec3 F = F_Schlick(VoH, f0);
-        vec3 spec = D_GGX(NoH, a) * V_Smith(NoV, NoL, a) * F / 4.0;
-        float cone = smoothstep(-0.25, 0.55, -l.y);  // solo ilumina hacia abajo
-        col += (diff / PI * (1.0 - F) + spec) * uDeckLightColor * NoL * cone / dist2;
-      }
-      // Hemisferio (ambiente) con un toque de reflejo difuso
+      vec3 col = directional(uLightDir, uLightColor, n, v, diff, f0, a) * shadow;
+      col += diff / PI * uFillColor * max(dot(n, uFillDir), 0.0);          // relleno: solo difuso (luz amplia y suave)
+      col += tube(uTubeA[0], uTubeB[0], uTubeColor[0], uTubeRadius[0], n, v, p, diff, f0, a);
+      col += tube(uTubeA[1], uTubeB[1], uTubeColor[1], uTubeRadius[1], n, v, p, diff, f0, a) * mix(0.35, 1.0, shadow);   // el foco del pin deck comparte (atenuada) la sombra principal
+      // Hemisferio (ambiente) con reflejo difuso del entorno
       float hemi = n.y * 0.5 + 0.5;
       vec3 amb = mix(uGroundColor, uSkyColor, hemi);
       float NoV = max(dot(n, v), 1e-4);
       vec3 Fa = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - NoV, 5.0);
-      col += (diff * amb + Fa * amb * 0.5 * (1.0 - rough)) * ao;
+      col += (diff * amb + Fa * amb * 0.6 * (1.0 - rough)) * ao;
       return col;
     }
+    // Brillo sobre blanco (para el bloom) y tono ACES
+    float glowOf(vec3 c) { return clamp((luma(c * uExposure) - 1.0) * 0.6, 0.0, 1.0); }
     vec3 tonemap(vec3 c) {
       c *= uExposure;
-      // ACES (Narkowicz)
       c = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
       return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
     }`;
@@ -1788,32 +2008,74 @@ const BowlingRenderer = (function () {
   const FS_STD = FS_COMMON + `
     uniform sampler2D uAlbedoMap; uniform float uUseMap;
     uniform vec3 uAlbedo; uniform float uRough; uniform float uMetal; uniform vec3 uEmissive; uniform float uAlpha;
-    uniform vec2 uUvScale;
+    uniform vec2 uUvScale; uniform float uF0; uniform float uEmissiveMap; uniform float uSimple;
     void main() {
       if (vClip < 0.0) discard;
       vec3 n = normalize(vNrm);
       if (!gl_FrontFacing) n = -n;
       vec3 albedo = uAlbedo;
       float rough = uRough;
-      if (uUseMap > 0.5) { vec4 t = texture2D(uAlbedoMap, vUv * uUvScale); albedo *= pow(t.rgb, vec3(2.2)); rough = mix(rough, 1.0, (1.0 - t.a) * 0.6); }
       float ao = 1.0;
-      vec3 col = shade(albedo, rough, uMetal, n, vPos, ao, shadowFactor(n)) + uEmissive;
-      gl_FragColor = vec4(tonemap(col), uAlpha);
+      vec3 em = uEmissive;
+      if (uUseMap > 0.5) {
+        vec4 t = texture2D(uAlbedoMap, vUv * uUvScale);
+        vec3 tc = pow(t.rgb, vec3(2.2));
+        albedo *= tc;
+        rough = mix(rough, 0.9, (1.0 - t.a) * 0.8);
+        em = mix(em, em * tc, uEmissiveMap);   // pantalla retroiluminada: la emisión sigue la imagen
+      }
+      vec3 col;
+      if (uSimple > 0.5) {
+        // Superficies mates y grandes (suelo, techo, fascia): solo difusa, sin sombras ni luces lineales
+        float hemi = n.y * 0.5 + 0.5;
+        vec3 amb = mix(uGroundColor, uSkyColor, hemi);
+        vec3 ld = normalize(mix(uTubeA[0], uTubeB[0], 0.5) - vPos);
+        col = albedo * (amb + uLightColor / PI * max(dot(n, uLightDir), 0.0) + uFillColor / PI * max(dot(n, uFillDir), 0.0) + uTubeColor[0] * uTubeRadius[0] / max(length(mix(uTubeA[0], uTubeB[0], 0.5) - vPos), 1.0) * max(dot(n, ld), 0.0) * 0.5) + em;
+      } else col = shade(albedo, rough, uMetal, n, vPos, ao, shadowFactor(n)) + em;
+      // f0 más alto para plásticos con laca (bolos)
+      if (uF0 > 0.0) { vec3 v = normalize(uCamPos - vPos); float NoV = max(dot(n, v), 1e-4); col += uF0 * pow(1.0 - NoV, 5.0) * uSkyColor * 2.0; }
+      gl_FragColor = vec4(tonemap(col), uAlpha < 1.0 ? uAlpha : glowOf(col));
     }`;
 
-  // Pista de madera con reflejo planar proyectado y brillo del aceite
+  // Pista de madera: zonas (arce/pino/pin deck), juntas, aceite, huellas, reflejo planar
   const FS_LANE = FS_COMMON + `
     uniform sampler2D uWood; uniform sampler2D uReflection; uniform mat4 uReflVP;
     uniform float uOilEnd; uniform float uReflStrength; uniform vec2 uWoodScale;
-    uniform float uLaneHalf; uniform float uGutterOn;
+    uniform float uLaneHalf; uniform float uDeckStart; uniform float uPitZ; uniform float uBoard;
+    uniform float uIsApproach; uniform float uDeckDark; uniform float uCenterX;
+    float hash1(float n) { return fract(sin(n * 127.1 + 311.7) * 43758.5453); }
     void main() {
       if (vClip < 0.0) discard;
       vec3 n = normalize(vNrm);
       vec4 w = texture2D(uWood, vUv * uWoodScale);
       vec3 albedo = pow(w.rgb, vec3(2.2));
-      // Aceite: zona delantera más brillante, final seco y mate
-      float oil = 1.0 - smoothstep(uOilEnd - 1.5, uOilEnd + 0.8, vPos.z);
-      float rough = mix(0.34, 0.1, oil) + (1.0 - w.a) * 0.12;
+      float x = vPos.x - uCenterX, z = vPos.z;
+      // Zonas: arce (cabeceras, 0-4,6 m), pino (centro) y arce en la zona de bolos
+      float pine = smoothstep(4.3, 5.2, z) * (1.0 - smoothstep(16.0, 16.9, z));
+      albedo *= mix(vec3(1.0), vec3(1.04, 0.99, 0.86), pine);
+      // Juntas a tope por tabla (cada tabla tiene su periodo y desfase)
+      float bi = floor((x + uLaneHalf) / uBoard);
+      float hb = hash1(bi);
+      float period = 1.5 + hb * 1.6;
+      float jz = fract((z + hb * 9.0) / period) * period;
+      float dcam = distance(uCamPos, vPos);
+      float jointW = 0.0025 + dcam * 0.0006;
+      float joint = 1.0 - smoothstep(jointW, jointW * 2.0, min(jz, period - jz));
+      joint *= 1.0 - smoothstep(10.0, 22.0, dcam);
+      albedo *= 1.0 - 0.35 * joint * (1.0 - uIsApproach);
+      // Pin deck sintético oscuro
+      float deck = smoothstep(uDeckStart - 0.01, uDeckStart + 0.01, z) * uDeckDark;
+      albedo = mix(albedo, vec3(0.03, 0.031, 0.035), deck);
+      // Aceite: patrón de casa (largo con buffer y cola) y perfil transversal (más en el centro)
+      float ax = abs(x) / uLaneHalf;
+      float cross = 0.5 + 0.5 * (1.0 - smoothstep(0.45, 1.0, ax));
+      float along = (1.0 - smoothstep(uOilEnd - 2.2, uOilEnd + 0.4, z)) * mix(1.0, 0.65, smoothstep(6.0, uOilEnd - 2.0, z));
+      float oil = along * cross * (1.0 - uIsApproach);
+      // Huellas de aceite arrastrado por las bolas más allá del patrón
+      float track = exp(-pow((abs(x) - 0.16) / 0.07, 2.0)) * smoothstep(uOilEnd - 1.0, uOilEnd + 2.5, z) * (1.0 - smoothstep(uDeckStart - 0.5, uDeckStart, z)) * 0.5;
+      float rough = mix(mix(0.42, 0.28, uIsApproach), 0.07, clamp(oil + track, 0.0, 1.0)) + (1.0 - w.a) * 0.1;
+      rough = mix(rough, 0.32, deck);
+      // Veta como microrrelieve: inclina la normal según el canal alfa (brillo) de la madera
       float ao = 1.0;
       vec3 col = shade(albedo, rough, 0.0, n, vPos, ao, shadowFactor(n));
       // Reflejo planar (Fresnel) atenuado por la rugosidad
@@ -1822,21 +2084,21 @@ const BowlingRenderer = (function () {
       if (uReflStrength > 0.0 && ruv.x >= 0.0 && ruv.x <= 1.0 && ruv.y >= 0.0 && ruv.y <= 1.0) {
         vec3 v = normalize(uCamPos - vPos);
         float NoV = max(dot(n, v), 0.0);
-        float fres = 0.04 + 0.96 * pow(1.0 - NoV, 5.0);
-        // Desenfoque sencillo según rugosidad (4 muestras)
-        vec2 o = vec2(0.004, 0.004) * rough * 6.0;
-        vec3 refl = pow(texture2D(uReflection, ruv).rgb, vec3(2.2)) * 0.4
-          + pow(texture2D(uReflection, ruv + vec2(o.x, 0.0)).rgb, vec3(2.2)) * 0.15 + pow(texture2D(uReflection, ruv - vec2(o.x, 0.0)).rgb, vec3(2.2)) * 0.15
-          + pow(texture2D(uReflection, ruv + vec2(0.0, o.y)).rgb, vec3(2.2)) * 0.15 + pow(texture2D(uReflection, ruv - vec2(0.0, o.y)).rgb, vec3(2.2)) * 0.15;
-        float k = uReflStrength * (0.035 + 0.6 * pow(1.0 - NoV, 4.0)) * (1.0 - rough * 0.85);
-        col = mix(col, refl, clamp(k, 0.0, 0.5));
+        float gloss = 1.0 - rough;
+        vec2 o = vec2(0.006, 0.004) * (0.3 + rough * 5.0);
+        vec3 r0 = texture2D(uReflection, ruv).rgb, r1 = texture2D(uReflection, ruv + vec2(o.x, 0.0)).rgb, r2 = texture2D(uReflection, ruv - vec2(o.x, 0.0)).rgb;
+        vec3 r3 = texture2D(uReflection, ruv + vec2(0.0, o.y)).rgb, r4 = texture2D(uReflection, ruv - vec2(0.0, o.y)).rgb;
+        vec3 refl = r0 * r0 * 0.36 + (r1 * r1 + r2 * r2 + r3 * r3 + r4 * r4) * 0.16;   // sRGB→lineal aproximado (gamma 2)
+        float k = uReflStrength * (0.04 + 0.7 * pow(1.0 - NoV, 4.0)) * gloss * gloss * (1.0 - deck * 0.6);
+        col = mix(col, refl * 1.15, clamp(k, 0.0, 0.6));
       }
-      gl_FragColor = vec4(tonemap(col), 1.0);
+      gl_FragColor = vec4(tonemap(col), glowOf(col));
     }`;
 
-  // Bola: textura de resina reactiva con agujeros, muy brillante
+  // Bola: resina reactiva perlada con agujeros, laca y escamas que destellan
   const FS_BALL = FS_COMMON + `
     uniform sampler2D uBallMap; uniform float uRough;
+    float hash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
     void main() {
       if (vClip < 0.0) discard;
       vec3 n = normalize(vNrm);
@@ -1844,9 +2106,37 @@ const BowlingRenderer = (function () {
       vec3 albedo = pow(t.rgb, vec3(2.2));
       float hole = 1.0 - t.a;                 // alfa < 1 = agujero
       float rough = mix(uRough, 0.9, hole);
-      albedo = mix(albedo, vec3(0.01), hole);
-      vec3 col = shade(albedo, rough, 0.0, n, vPos, 1.0 - hole * 0.6, shadowFactor(n));
-      gl_FragColor = vec4(tonemap(col), 1.0);
+      albedo = mix(albedo, vec3(0.012), hole);
+      float sh = shadowFactor(n);
+      vec3 col = shade(albedo, rough, 0.0, n, vPos, 1.0 - hole * 0.7, sh);
+      // Escamas de mica: celdas aleatorias con normal propia que destellan con las luces
+      vec2 cell = floor(vUv * vec2(520.0, 260.0));
+      float fl = step(0.972, hash2(cell)) * (1.0 - hole);
+      if (fl > 0.0) {
+        vec3 nf = normalize(n + (vec3(hash2(cell + 1.3), hash2(cell + 2.7), hash2(cell + 4.1)) - 0.5) * 0.5);
+        vec3 v = normalize(uCamPos - vPos);
+        float s = 0.0;
+        for (int i = 0; i < 2; i++) {
+          vec3 l = normalize(mix(uTubeA[i], uTubeB[i], 0.5) - vPos);
+          s += pow(max(dot(nf, normalize(l + v)), 0.0), 240.0) * luma(uTubeColor[i]) * 0.012;
+        }
+        s += pow(max(dot(nf, normalize(uLightDir + v)), 0.0), 240.0) * luma(uLightColor) * 0.6;
+        col += s * sh * vec3(1.0, 0.96, 0.9);
+      }
+      gl_FragColor = vec4(tonemap(col), glowOf(col));
+    }`;
+
+  // Calcomanías planas (sombras de contacto, marcas de los bolos, marcas de rango): color + alfa radial
+  const VS_DECAL = `
+    attribute vec3 aPos; attribute vec2 aUv; uniform mat4 uModel, uView, uProj; varying vec2 vUv;
+    void main() { vUv = aUv; gl_Position = uProj * uView * uModel * vec4(aPos, 1.0); }`;
+  const FS_DECAL = `
+    precision mediump float; varying vec2 vUv; uniform vec3 uColor; uniform float uAlpha; uniform float uSoft; uniform float uShape;
+    void main() {
+      vec2 d = vUv * 2.0 - 1.0;
+      float r = uShape > 0.5 ? max(abs(d.x), abs(d.y)) : length(d);
+      float a = (1.0 - smoothstep(uSoft, 1.0, r)) * uAlpha;
+      gl_FragColor = vec4(uColor, a);
     }`;
 
   // Profundidad para el mapa de sombras (empaquetada en RGBA)
@@ -1862,59 +2152,78 @@ const BowlingRenderer = (function () {
       gl_FragColor = c;
     }`;
 
-  // Pantalla completa: FXAA ligero + viñeta
+  // Pantalla completa
   const VS_QUAD = `attribute vec2 aPos; varying vec2 vUv; void main() { vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+  // Extracción de brillo (alfa = brillo sobre blanco) con reducción 2x2
+  const FS_BRIGHT = `
+    precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform vec2 uTexel;
+    void main() {
+      vec4 a = texture2D(uTex, vUv + uTexel * vec2(-0.5, -0.5)), b = texture2D(uTex, vUv + uTexel * vec2(0.5, -0.5));
+      vec4 c = texture2D(uTex, vUv + uTexel * vec2(-0.5, 0.5)), d = texture2D(uTex, vUv + uTexel * vec2(0.5, 0.5));
+      vec3 s = (a.rgb * a.a + b.rgb * b.a + c.rgb * c.a + d.rgb * d.a) * 0.25;
+      gl_FragColor = vec4(s, 1.0);
+    }`;
+  const FS_BLUR = `
+    precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform vec2 uDir;
+    void main() {
+      vec3 s = texture2D(uTex, vUv).rgb * 0.2270270270;
+      s += (texture2D(uTex, vUv + uDir * 1.3846153846).rgb + texture2D(uTex, vUv - uDir * 1.3846153846).rgb) * 0.3162162162;
+      s += (texture2D(uTex, vUv + uDir * 3.2307692308).rgb + texture2D(uTex, vUv - uDir * 3.2307692308).rgb) * 0.0702702703;
+      gl_FragColor = vec4(s, 1.0);
+    }`;
+  // Composición final: FXAA ligero + bloom + viñeta + grano
   const FS_POST = `
-    precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform vec2 uTexel; uniform float uVignette;
+    precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform sampler2D uBloom; uniform vec2 uTexel;
+    uniform float uVignette; uniform float uBloomK; uniform float uGrain; uniform float uTime;
+    float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
     void main() {
       vec3 c = texture2D(uTex, vUv).rgb;
-      // FXAA simplificado (3x3 ponderado por diferencia de luminancia)
       vec3 n = texture2D(uTex, vUv + vec2(0.0, uTexel.y)).rgb, s = texture2D(uTex, vUv - vec2(0.0, uTexel.y)).rgb;
       vec3 e = texture2D(uTex, vUv + vec2(uTexel.x, 0.0)).rgb, w = texture2D(uTex, vUv - vec2(uTexel.x, 0.0)).rgb;
-      float lc = dot(c, vec3(0.299, 0.587, 0.114));
-      float ln = dot(n, vec3(0.299, 0.587, 0.114)), ls = dot(s, vec3(0.299, 0.587, 0.114));
-      float le = dot(e, vec3(0.299, 0.587, 0.114)), lw = dot(w, vec3(0.299, 0.587, 0.114));
-      float lmin = min(lc, min(min(ln, ls), min(le, lw))), lmax = max(lc, max(max(ln, ls), max(le, lw)));
-      float range = lmax - lmin;
+      float lc = lum(c), ln = lum(n), ls = lum(s), le = lum(e), lw = lum(w);
+      float range = max(lc, max(max(ln, ls), max(le, lw))) - min(lc, min(min(ln, ls), min(le, lw)));
       if (range > 0.08) { c = (c * 2.0 + n + s + e + w) / 6.0; }
+      vec3 bloom = texture2D(uBloom, vUv).rgb;
+      c += bloom * uBloomK;
       vec2 d = vUv - 0.5;
       c *= 1.0 - uVignette * dot(d, d) * 1.6;
+      float g = fract(sin(dot(gl_FragCoord.xy + uTime, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+      c += g * uGrain;
       gl_FragColor = vec4(c, 1.0);
     }`;
 
   // ------------------------------------------------------------ texturas procedurales
-  /** Madera de la pista: 39 tablas de arce/pino con veta, juntas y variación. RGB = color, A = brillo (1 = liso). */
-  function makeWoodTexture(size, seed) {
+  /** Madera de la pista: 39 tablas de arce con veta, juntas y variación. RGB = color, A = brillo (1 = liso). */
+  function makeWoodTexture(size, seed, opts) {
+    const o = opts || {};
     const c = document.createElement('canvas');
     c.width = size; c.height = size;
     const ctx = c.getContext('2d');
     const img = ctx.createImageData(size, size);
     const d = img.data;
     const noise = G.makeNoise(seed || 7);
-    const boards = 39;
+    const boards = o.boards || 39;
+    const base = o.base || [226, 194, 140];
     for (let y = 0; y < size; y++) {
       for (let x = 0; x < size; x++) {
         const bx = (x / size) * boards;                 // tabla
         const bi = Math.floor(bx), fx = bx - bi;
-        // Variación por tabla (arce claro / tono)
         const tone = 0.9 + 0.16 * noise.noise2(bi * 12.9898 + 0.5, 3.1);
         const hue = noise.noise2(bi * 3.7 + 1.0, 7.3);
-        // Veta longitudinal (a lo largo de y) con ligera ondulación
+        // Veta longitudinal (a lo largo de y) con ligera ondulación y líneas finas de crecimiento
         const grain = noise.fbm(x * 0.09 + bi * 10, y * 0.012 + bi * 5, 3) * 0.5 + 0.5;
         const fine = noise.noise2(x * 0.6 + bi, y * 0.05) * 0.5 + 0.5;
-        // Arce (#E3C48F) en las cabeceras y zona de bolos, pino más amarillo (#E9CC8E) en el centro: la v va a lo largo de la pista
-        const zf = y / size;                              // 0 = línea de falta, 1 = fondo (la textura se repite cada 3 m; usamos sólo tono)
-        const pine = 0.5 + 0.5 * Math.sin(zf * Math.PI * 2);
-        let r = (227 + 6 * pine) * tone + hue * 10, g = (196 + 8 * pine) * tone + hue * 4, b = (143 - 1 * pine) * tone - hue * 6;
-        const g1 = 0.78 + 0.22 * grain;
+        const rings = 0.5 + 0.5 * Math.sin((noise.fbm(x * 0.03 + bi * 3, y * 0.004, 2) * 6.0 + bi) * 7.0);
+        let r = base[0] * tone + hue * 10, g = base[1] * tone + hue * 4, b = base[2] * tone - hue * 6;
+        const g1 = 0.8 + 0.2 * grain - 0.05 * rings;
         r *= g1; g *= g1 * (0.98 + 0.04 * fine); b *= g1;
         // Juntas entre tablas (oscuras) y bordes ligeramente más claros
         const edge = Math.min(fx, 1 - fx);
-        const joint = edge < 0.035 ? 0.72 : edge < 0.09 ? 0.95 : 1.0;
+        const joint = edge < 0.03 ? 0.7 : edge < 0.08 ? 0.95 : 1.0;
         r *= joint; g *= joint; b *= joint;
         const i = (y * size + x) * 4;
         d[i] = Math.max(0, Math.min(255, r)); d[i + 1] = Math.max(0, Math.min(255, g)); d[i + 2] = Math.max(0, Math.min(255, b));
-        d[i + 3] = Math.round(255 * (0.75 + 0.25 * fine * (joint < 1 ? 0.5 : 1)));
+        d[i + 3] = Math.round(255 * (0.72 + 0.28 * fine * (joint < 1 ? 0.5 : 1)));
       }
     }
     ctx.putImageData(img, 0, 0);
@@ -1932,7 +2241,6 @@ const BowlingRenderer = (function () {
     for (let y = 0; y < c.height; y++) {
       for (let x = 0; x < c.width; x++) {
         const u = x / c.width, v = y / c.height;
-        // Coordenadas esféricas para que la veta no se pellizque en los polos
         const th = u * Math.PI * 2, ph = v * Math.PI;
         const px = Math.cos(th) * Math.sin(ph), py = Math.cos(ph), pz = Math.sin(th) * Math.sin(ph);
         const n1 = noise.fbm(px * 2.2 + 3, py * 2.2 + pz * 1.3, 4);
@@ -1947,61 +2255,124 @@ const BowlingRenderer = (function () {
       }
     }
     ctx.putImageData(img, 0, 0);
-    // Agujeros: dos de dedos y pulgar (agarre convencional) alrededor de un punto de la esfera
+    // Agujeros: dos de dedos (31/32 in) y pulgar (1 1/8 in) en agarre convencional
     const hole = (u, v, rad) => {
       ctx.save();
       ctx.globalCompositeOperation = 'destination-out';
       ctx.beginPath(); ctx.ellipse(u * c.width, v * c.height, rad * c.width, rad * c.width / Math.max(0.35, Math.sin(v * Math.PI)), 0, 0, Math.PI * 2); ctx.fill();
       ctx.restore();
     };
-    hole(0.25, 0.42, 0.012); hole(0.29, 0.42, 0.012); hole(0.27, 0.52, 0.016);
-    // Logo grabado sutil
-    ctx.save(); ctx.globalAlpha = 0.25; ctx.fillStyle = '#ffffff'; ctx.font = `bold ${Math.round(size * 0.03)}px system-ui, sans-serif`; ctx.textAlign = 'center';
-    ctx.fillText('STRIKE', c.width * 0.75, c.height * 0.5); ctx.restore();
+    hole(0.25, 0.42, 0.0115); hole(0.29, 0.42, 0.0115); hole(0.27, 0.53, 0.0145);
+    // Logo y número de serie grabados (sutiles)
+    ctx.save(); ctx.globalAlpha = 0.28; ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(size * 0.03)}px system-ui, sans-serif`; ctx.fillText('STRIKE', c.width * 0.75, c.height * 0.5);
+    ctx.font = `${Math.round(size * 0.012)}px system-ui, sans-serif`; ctx.fillText('15 LB · 7X21834', c.width * 0.75, c.height * 0.56);
+    ctx.restore();
     return c;
   }
-  /** Cara frontal de la unidad de enmascaramiento: panel oscuro con rótulo, neón y número de pista. */
-  function makeMaskTexture(w, h, laneNumber) {
-    const c = document.createElement('canvas');
+  /** Cara frontal de la unidad de enmascaramiento (vídeo): panel oscuro con rótulo, LED y número de pista; status opcional. */
+  function makeMaskTexture(w, h, laneNumber, status, canvas) {
+    const c = canvas || document.createElement('canvas');
     c.width = w; c.height = h;
     const ctx = c.getContext('2d');
     const g = ctx.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, '#0b1020'); g.addColorStop(0.55, '#141c33'); g.addColorStop(1, '#0a0e1b');
+    g.addColorStop(0, '#0a0d18'); g.addColorStop(0.5, '#121a2e'); g.addColorStop(1, '#070a14');
     ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
-    // Degradado radial suave (luz del panel)
-    const rg = ctx.createRadialGradient(w * 0.5, h * 0.55, h * 0.1, w * 0.5, h * 0.55, w * 0.6);
-    rg.addColorStop(0, 'rgba(90,110,170,0.35)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+    // Marco del panel y bisel
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = Math.max(2, h * 0.012);
+    ctx.strokeRect(w * 0.02, h * 0.04, w * 0.96, h * 0.92);
+    // Luz del panel (vídeo): gradiente radial
+    const rg = ctx.createRadialGradient(w * 0.5, h * 0.5, h * 0.05, w * 0.5, h * 0.5, w * 0.55);
+    rg.addColorStop(0, 'rgba(70,95,170,0.4)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = rg; ctx.fillRect(0, 0, w, h);
-    // Tiras de neón con halo
-    const strips = [[0.3, '#ff5a7a'], [0.4, '#38bdf8'], [0.5, '#f5b942']];
-    for (const [y, col] of strips) {
+    // Tira LED inferior y superior
+    for (const [y, col] of [[0.085, '#ff4d6d'], [0.915, '#38bdf8']]) {
       const yy = h * y;
-      const halo = ctx.createLinearGradient(0, yy - h * 0.05, 0, yy + h * 0.05);
-      halo.addColorStop(0, 'rgba(0,0,0,0)'); halo.addColorStop(0.5, col + 'aa'); halo.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = halo; ctx.fillRect(w * 0.08, yy - h * 0.05, w * 0.84, h * 0.1);
-      ctx.fillStyle = col; ctx.fillRect(w * 0.08, yy - h * 0.02, w * 0.84, h * 0.04);
+      const halo = ctx.createLinearGradient(0, yy - h * 0.06, 0, yy + h * 0.06);
+      halo.addColorStop(0, 'rgba(0,0,0,0)'); halo.addColorStop(0.5, col + '99'); halo.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = halo; ctx.fillRect(w * 0.06, yy - h * 0.06, w * 0.88, h * 0.12);
+      ctx.fillStyle = col; ctx.fillRect(w * 0.06, yy - h * 0.012, w * 0.88, h * 0.024);
     }
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#f5b942'; ctx.font = `800 ${Math.round(h * 0.3)}px system-ui, sans-serif`;
-    ctx.fillText(String(laneNumber), w * 0.5, h * 0.76);
-    ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.font = `700 ${Math.round(h * 0.13)}px system-ui, sans-serif`;
-    ctx.fillText('BOWLING', w * 0.5, h * 0.16);
+    // Número de pista grande a la izquierda
+    ctx.fillStyle = '#f5b942'; ctx.font = `800 ${Math.round(h * 0.42)}px system-ui, sans-serif`;
+    ctx.fillText(String(laneNumber), w * 0.2, h * 0.52);
+    ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = `600 ${Math.round(h * 0.09)}px system-ui, sans-serif`;
+    ctx.fillText('PISTA', w * 0.2, h * 0.8);
+    // Zona de estado (nombre del jugador / strike)
+    const st = status || { line1: 'BOWLING', line2: 'CENTER' };
+    ctx.fillStyle = st.color || '#ffffff'; ctx.font = `800 ${Math.round(h * (st.big ? 0.3 : 0.2))}px system-ui, sans-serif`;
+    ctx.fillText(String(st.line1 || '').slice(0, 16), w * 0.62, h * (st.line2 ? 0.42 : 0.52));
+    if (st.line2) { ctx.fillStyle = 'rgba(255,255,255,0.75)'; ctx.font = `600 ${Math.round(h * 0.12)}px system-ui, sans-serif`; ctx.fillText(String(st.line2).slice(0, 24), w * 0.62, h * 0.66); }
+    return c;
+  }
+  /** Textura del bolo por altura (v = altura / 0,381): blanco con dos franjas rojas en el cuello, corona y desgaste de la línea de bola. */
+  function makePinTexture(w, h) {
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const H = 15 * 0.0254;
+    const row = (m) => h * (1 - m / H);                  // v crece con la altura: fila 0 = arriba
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#f6f5f1'); g.addColorStop(0.75, '#f4f2ec'); g.addColorStop(1, '#efebe0');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+    // Franjas rojas (USBC/Brunswick: 9,45-9,80 in y 10,30-10,65 in)
+    ctx.fillStyle = '#cf1f2b';
+    for (const [a, b] of [[0.2400, 0.2489], [0.2616, 0.2705]]) ctx.fillRect(0, row(b), w, Math.max(2, row(a) - row(b)));
+    // Corona del fabricante en la panza (una sola vez alrededor) y texto
+    const cx = w * 0.5, cy = row(0.152), s = w * 0.11;
+    ctx.fillStyle = '#cf1f2b';
+    ctx.beginPath();
+    ctx.moveTo(cx - s, cy + s * 0.6); ctx.lineTo(cx - s * 1.1, cy - s * 0.5); ctx.lineTo(cx - s * 0.45, cy); ctx.lineTo(cx, cy - s * 0.9);
+    ctx.lineTo(cx + s * 0.45, cy); ctx.lineTo(cx + s * 1.1, cy - s * 0.5); ctx.lineTo(cx + s, cy + s * 0.6); ctx.closePath(); ctx.fill();
+    ctx.fillRect(cx - s, cy + s * 0.75, 2 * s, s * 0.22);
+    ctx.fillStyle = '#1d2d6b'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = `700 ${Math.round(w * 0.075)}px system-ui, sans-serif`; ctx.fillText('MAX', cx, row(0.128));
+    ctx.font = `600 ${Math.round(w * 0.045)}px system-ui, sans-serif`; ctx.fillText('USBC APPROVED', cx, row(0.112));
+    // Desgaste de la línea de bola (gris, más rugoso) y suciedad en la base
+    const img = ctx.getImageData(0, 0, w, h); const d = img.data;
+    const noise = G.makeNoise(5);
+    for (let y = 0; y < h; y++) {
+      const m = H * (1 - y / h);
+      const wear = Math.exp(-Math.pow((m - 0.112) / 0.02, 2)) * 0.45 + Math.max(0, 1 - m / 0.02) * 0.5;
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        const n = noise.fbm(x * 0.15, y * 0.05, 3) * 0.5 + 0.5;
+        const k = wear * (0.4 + 0.6 * n);
+        d[i] = d[i] * (1 - 0.22 * k); d[i + 1] = d[i + 1] * (1 - 0.22 * k); d[i + 2] = d[i + 2] * (1 - 0.2 * k);
+        d[i + 3] = Math.round(255 * (1 - 0.55 * k));
+      }
+    }
+    ctx.putImageData(img, 0, 0);
     return c;
   }
 
-  // ------------------------------------------------------------ perfil del bolo (USBC, altura y radio en m)
-  const PIN_PROFILE = [
-    [0.000, 0.0000], [0.000, 0.0258], [0.006, 0.0275], [0.020, 0.0330], [0.040, 0.0420], [0.060, 0.0500], [0.080, 0.0560],
-    [0.100, 0.0595], [0.114, 0.0605], [0.130, 0.0600], [0.150, 0.0580], [0.170, 0.0540], [0.190, 0.0485], [0.210, 0.0425],
-    [0.230, 0.0365], [0.250, 0.0305], [0.270, 0.0255], [0.285, 0.0228], [0.300, 0.0240], [0.315, 0.0290], [0.330, 0.0325],
-    [0.345, 0.0330], [0.360, 0.0300], [0.372, 0.0220], [0.379, 0.0110], [0.381, 0.0000],
-  ];
+  // ------------------------------------------------------------ perfil del bolo (USBC, 15 estaciones) con PCHIP y corona de radio 1,273 in
+  const IN = 0.0254;
+  const PIN_TABLE = [[0, 2.031], [0.75, 2.828], [2.25, 3.906], [3.375, 4.51], [4.5, 4.766], [5.875, 4.563], [7.25, 3.703], [8.625, 2.472],
+    [9.375, 1.965], [10, 1.797], [10.875, 1.87], [11.75, 2.094], [12.625, 2.406], [13.5, 2.547], [14.375, 2.094]];
+  function pinProfile(step, arcStep) {
+    const f = G.pchip(PIN_TABLE.map((p) => p[0] * IN), PIN_TABLE.map((p) => p[1] * IN / 2));
+    const H = 15 * IN, pts = [];
+    pts.push([0, 0], [0, 0.0235], [0.0012, 0.0248], [0.003, 0.0256]);   // base plana y borde redondeado (5/32 in)
+    for (let h = 0.006; h <= 13.5 * IN + 1e-9; h += step) pts.push([h, f(h)]);
+    if (pts[pts.length - 1][0] < 13.5 * IN - 1e-6) pts.push([13.5 * IN, f(13.5 * IN)]);
+    const cz = 13.727 * IN, R = 1.273 * IN;
+    for (let a = Math.asin((13.5 * IN - cz) / R) + 0.06; a < Math.PI / 2 - 0.05; a += arcStep) pts.push([cz + R * Math.sin(a), R * Math.cos(a)]);
+    pts.push([H, 0]);
+    return pts.map(([y, r]) => [y, r, y / H]);
+  }
+  const PIN_PROFILE = pinProfile(0.007, 0.12);        // detalle para la pista del jugador
+  const PIN_PROFILE_LOW = pinProfile(0.013, 0.24);    // pistas vecinas
 
-  return { VS_MAIN, FS_STD, FS_LANE, FS_BALL, VS_DEPTH, FS_DEPTH, VS_QUAD, FS_POST, makeWoodTexture, makeBallTexture, makeMaskTexture, PIN_PROFILE, M4, G };
+  return {
+    VS_MAIN, FS_STD, FS_LANE, FS_BALL, VS_DECAL, FS_DECAL, VS_DEPTH, FS_DEPTH, VS_QUAD, FS_BRIGHT, FS_BLUR, FS_POST,
+    makeWoodTexture, makeBallTexture, makeMaskTexture, makePinTexture, PIN_PROFILE, PIN_PROFILE_LOW, PIN_TABLE, M4, G,
+  };
 })();
 /* ==========================================================================
-   Renderizador WebGL, parte B: escena, pasadas (sombra, reflejo, principal,
-   post-proceso), cámara y API pública.
+   Renderizador WebGL, parte B: escena (pista, canales, capping, retorno de
+   bolas, pistas vecinas con bolos, unidades de enmascaramiento, mesa y barra
+   del pinsetter), pasadas (sombra, reflejo, principal, bloom, post) y API.
    ========================================================================== */
 const BowlingRenderer3D = (function () {
   'use strict';
@@ -2019,119 +2390,174 @@ const BowlingRenderer3D = (function () {
     const progStd = G.program(gl, R.VS_MAIN, R.FS_STD);
     const progLane = G.program(gl, R.VS_MAIN, R.FS_LANE);
     const progBall = G.program(gl, R.VS_MAIN, R.FS_BALL);
+    const progDecal = G.program(gl, R.VS_DECAL, R.FS_DECAL);
     const progDepth = G.program(gl, R.VS_DEPTH, R.FS_DEPTH);
+    const progBright = G.program(gl, R.VS_QUAD, R.FS_BRIGHT);
+    const progBlur = G.program(gl, R.VS_QUAD, R.FS_BLUR);
     const progPost = G.program(gl, R.VS_QUAD, R.FS_POST);
 
     // ---------- texturas ----------
     const woodTex = G.texture2D(gl, R.makeWoodTexture(1024, 7), { repeat: true });
+    const approachTex = G.texture2D(gl, R.makeWoodTexture(512, 3, { base: [230, 206, 158] }), { repeat: true });
     const ballTex = G.texture2D(gl, R.makeBallTexture(1024, [[40, 24, 120], [150, 40, 170], [240, 200, 255]], 11), { repeat: false });
-    const maskTex = G.texture2D(gl, R.makeMaskTexture(1024, 512, 7), { repeat: false });
-    const approachCanvas = R.makeWoodTexture(512, 3);
-    const approachTex = G.texture2D(gl, approachCanvas, { repeat: true });
+    const ballTex2 = G.texture2D(gl, R.makeBallTexture(512, [[20, 60, 160], [40, 170, 220], [220, 240, 255]], 23), { repeat: false });
+    const ballTex3 = G.texture2D(gl, R.makeBallTexture(512, [[150, 20, 30], [240, 120, 40], [255, 230, 200]], 31), { repeat: false });
+    const pinTex = G.texture2D(gl, R.makePinTexture(256, 2048), { repeat: false, mipmap: true });
+    const LANE_NUMBER = 7;
+    const maskCanvas = R.makeMaskTexture(1024, 512, LANE_NUMBER, null);
+    const maskTex = G.texture2D(gl, maskCanvas, { repeat: false });
+    const maskTexL = G.texture2D(gl, R.makeMaskTexture(512, 256, LANE_NUMBER - 1, { line1: 'LIGA', line2: 'MIÉRCOLES 20:30' }), { repeat: false });
+    const maskTexR = G.texture2D(gl, R.makeMaskTexture(512, 256, LANE_NUMBER + 1, { line1: 'ABIERTA', line2: 'BIENVENIDOS' }), { repeat: false });
 
     // ---------- geometría estática ----------
     const hw = LANE.halfWidth, kb = LANE.kickbackX, gw = LANE.gutter;
+    const bw = LANE.width / LANE.boards;
+    const MASK_Z = LANE.deckStartZ - 0.05, MASK_Y0 = 0.8, MASK_Y1 = 1.95, CEIL = 4.6;
+    const NEIGH = 2 * kb + 0.5;                                       // paso entre pistas
     const laneMesh = G.createMesh(gl, ...pack(G.plane(-hw, hw, 0, LANE.pitZ, 2, 40, 0, 1)));
     const approachMesh = G.createMesh(gl, ...pack(G.plane(-kb - 0.05, kb + 0.05, -LANE.approach, 0, 2, 6, 0, 1)));
-    // Canales: dos medios tubos + bordes exteriores planos hasta la pared
+    // Canales: dos medios tubos
     const troughs = [];
-    for (const sgn of [-1, 1]) {
-      const cx = sgn * LANE.gutterCenterX;
-      troughs.push(G.trough(cx, LANE.gutterAxisY, LANE.gutterRadius, 0, LANE.deckStartZ, 10, 24, Math.PI * 1.25, Math.PI * 1.75));
-    }
+    for (const sgn of [-1, 1]) troughs.push(G.trough(sgn * LANE.gutterCenterX, LANE.gutterAxisY, LANE.gutterRadius, 0, LANE.deckStartZ, 10, 24, Math.PI * 1.25, Math.PI * 1.75));
     const gutterMesh = G.createMesh(gl, ...pack(G.merge(troughs)));
-    // Zona de bolos plana a los lados (canales planos) y plataforma hasta el foso
+    // Zona de bolos: canales planos hundidos, escalón de la plataforma y cierre de los tubos
     const fg = LANE.flatGutterDepth;
-    const deckSides = G.merge([
-      G.plane(-kb, -hw, LANE.deckStartZ, LANE.pitZ, 1, 2, -fg, 1), G.plane(hw, kb, LANE.deckStartZ, LANE.pitZ, 1, 2, -fg, 1),   // canales planos hundidos
-      G.box([-hw - 0.004, -fg, LANE.deckStartZ], [-hw, 0, LANE.pitZ], 1), G.box([hw, -fg, LANE.deckStartZ], [hw + 0.004, 0, LANE.pitZ], 1), // escalón de la plataforma
-      G.box([-kb, -fg, LANE.deckStartZ - 0.004], [-hw, -LANE.gutterDepth, LANE.deckStartZ], 1), G.box([hw, -fg, LANE.deckStartZ - 0.004], [kb, -LANE.gutterDepth, LANE.deckStartZ], 1), // cierre del tubo
-      G.plane(-kb, -hw, 0, LANE.deckStartZ, 1, 2, -0.004, 1), G.plane(hw, kb, 0, LANE.deckStartZ, 1, 2, -0.004, 1), // cubre tras los tubos
-    ]);
-    const deckSideMesh = G.createMesh(gl, ...pack(deckSides));
-    // Paredes laterales (kickbacks) y foso
-    const walls = G.merge([
-      G.box([-kb - 0.03, -LANE.pitDepth, LANE.deckStartZ - 0.3], [-kb, LANE.kickbackHeight, LANE.endZ], 1),
-      G.box([kb, -LANE.pitDepth, LANE.deckStartZ - 0.3], [kb + 0.03, LANE.kickbackHeight, LANE.endZ], 1),
-      G.box([-kb, -LANE.pitDepth - 0.02, LANE.pitZ], [kb, -LANE.pitDepth, LANE.endZ + 0.05], 1),      // suelo del foso
-      G.box([-kb, -LANE.pitDepth, LANE.endZ], [kb, LANE.kickbackHeight + 0.4, LANE.endZ + 0.05], 1),   // cojín del fondo
-      G.box([-kb, -LANE.pitDepth, LANE.pitZ - 0.02], [kb, 0, LANE.pitZ], 1),                           // frente del foso
-    ]);
-    const wallMesh = G.createMesh(gl, ...pack(walls));
-    // Unidad de enmascaramiento (panel sobre los bolos) y techo oscuro
-    const maskMesh = G.createMesh(gl, ...pack(G.box([-kb - 0.35, LANE.kickbackHeight + 0.2, LANE.endZ - 0.58], [kb + 0.35, LANE.kickbackHeight + 1.3, LANE.endZ - 0.5], 1)));
-    const maskUv = G.createMesh(gl, ...pack(quadXY(-kb - 0.35, kb + 0.35, LANE.kickbackHeight + 0.2, LANE.kickbackHeight + 1.3, LANE.endZ - 0.61)));
-    const roomMesh = G.createMesh(gl, ...pack(G.merge([
-      G.plane(-8, -kb - 0.03, -LANE.approach - 2, LANE.endZ + 1, 1, 2, -0.006, 0.2),   // suelo general (sin tapar el foso)
-      G.plane(kb + 0.03, 8, -LANE.approach - 2, LANE.endZ + 1, 1, 2, -0.006, 0.2),
-      G.plane(-kb - 0.03, kb + 0.03, -LANE.approach - 2, -LANE.approach, 1, 1, -0.006, 0.2),
-      G.plane(-kb - 0.03, kb + 0.03, LANE.endZ + 0.05, LANE.endZ + 1, 1, 1, -0.006, 0.2),
-      G.box([-8, 4.6, -LANE.approach - 2], [8, 4.65, LANE.endZ + 1], 1),      // techo
+    const deckSideMesh = G.createMesh(gl, ...pack(G.merge([
+      G.plane(-kb, -hw, LANE.deckStartZ, LANE.pitZ, 1, 2, -fg, 1), G.plane(hw, kb, LANE.deckStartZ, LANE.pitZ, 1, 2, -fg, 1),
+      G.box([-hw - 0.004, -fg, LANE.deckStartZ], [-hw, 0, LANE.pitZ], 1), G.box([hw, -fg, LANE.deckStartZ], [hw + 0.004, 0, LANE.pitZ], 1),
+      G.box([-kb, -fg, LANE.deckStartZ - 0.004], [-hw, -LANE.gutterDepth, LANE.deckStartZ], 1), G.box([hw, -fg, LANE.deckStartZ - 0.004], [kb, -LANE.gutterDepth, LANE.deckStartZ], 1),
+      G.plane(-kb, -hw, 0, LANE.deckStartZ, 1, 2, -0.004, 1), G.plane(hw, kb, 0, LANE.deckStartZ, 1, 2, -0.004, 1),
     ])));
-    // Pistas vecinas: pista + canales con el mismo material de madera
-    const neighbour = G.merge([-1, 1].map((sgn) => {
-      const cx = sgn * (2 * kb + 0.5);
+    // Paredes laterales (kickbacks con placa), foso, cojín
+    const wallMesh = G.createMesh(gl, ...pack(G.merge([
+      G.box([-kb - 0.07, -LANE.pitDepth, LANE.deckStartZ - 0.3], [-kb, LANE.kickbackHeight, LANE.endZ], 1),
+      G.box([kb, -LANE.pitDepth, LANE.deckStartZ - 0.3], [kb + 0.07, LANE.kickbackHeight, LANE.endZ], 1),
+      G.box([-kb, -LANE.pitDepth - 0.02, LANE.pitZ], [kb, -LANE.pitDepth, LANE.endZ + 0.05], 1),      // suelo del foso
+      G.box([-kb, -LANE.pitDepth, LANE.endZ], [kb, LANE.kickbackHeight + 1.4, LANE.endZ + 0.05], 1),   // cojín y fondo
+      G.box([-kb, -LANE.pitDepth, LANE.pitZ - 0.02], [kb, 0, LANE.pitZ], 1),                           // frente del foso
+    ])));
+    // Placas de los kickbacks (fenólicas, más claras) y columnas de la división al final de los canales
+    const plateMesh = G.createMesh(gl, ...pack(G.merge([
+      G.box([-kb - 0.004, 0, LANE.deckStartZ - 0.25], [-kb + 0.002, 0.45, LANE.endZ - 0.1], 1),
+      G.box([kb - 0.002, 0, LANE.deckStartZ - 0.25], [kb + 0.004, 0.45, LANE.endZ - 0.1], 1),
+    ])));
+    // Unidad de enmascaramiento: panel con imagen (hacia el jugador), caja y fascia hasta el techo (por pista)
+    const maskBox = G.box([-kb - 0.26, MASK_Y0, MASK_Z], [kb + 0.26, MASK_Y1 + 0.06, MASK_Z + 0.35], 1);
+    const maskMesh = G.createMesh(gl, ...pack(maskBox));
+    const maskUv = G.createMesh(gl, ...pack(quadXY(-kb - 0.24, kb + 0.24, MASK_Y0 + 0.03, MASK_Y1 + 0.03, MASK_Z - 0.012)));
+    const fasciaMesh = G.createMesh(gl, ...pack(G.merge([
+      G.box([-NEIGH * 1.5 - 1, MASK_Y1 + 0.06, MASK_Z + 0.02], [NEIGH * 1.5 + 1, CEIL + 0.1, MASK_Z + 0.4], 1),   // fascia superior continua
+      G.box([-NEIGH * 1.5 - 1, -0.5, LANE.endZ + 0.05], [NEIGH * 1.5 + 1, CEIL + 0.1, LANE.endZ + 0.4], 1),      // pared del fondo (sala de máquinas)
+    ])));
+    // Capping (división) entre pistas: caja redondeada baja a lo largo de la pista, y columna al final
+    const cappingMesh = G.createMesh(gl, ...pack(G.merge([-1, 1].map((s) => {
+      const x0 = s > 0 ? kb + 0.07 : -kb - 0.5, x1 = s > 0 ? kb + 0.5 : -kb - 0.07;
       return G.merge([
-        G.plane(cx - hw, cx + hw, 0, LANE.pitZ, 1, 8, 0, 1),
-        G.plane(cx - kb, cx - hw, 0, LANE.pitZ, 1, 1, -0.03, 1), G.plane(cx + hw, cx + kb, 0, LANE.pitZ, 1, 1, -0.03, 1),
+        G.box([x0, -0.01, -0.05], [x1, 0.07, LANE.deckStartZ - 0.3], 1),
+        G.box([x0 + 0.04, 0.07, -0.05], [x1 - 0.04, 0.1, LANE.deckStartZ - 0.3], 1),
+        G.box([x0, -0.01, LANE.deckStartZ - 0.3], [x1, LANE.kickbackHeight, LANE.endZ], 1),    // división entre kickbacks
       ]);
-    }));
-    const neighbourMesh = G.createMesh(gl, ...pack(neighbour));
-    // Luces del techo: tiras emisivas
+    }))));
+    // Retorno de bolas (lado izquierdo): capota redondeada junto a la línea de falta y bastidor con dos bolas
+    const BR_X = -kb - 0.285;
+    const ballReturnMesh = G.createMesh(gl, ...pack(G.merge([
+      G.box([BR_X - 0.25, 0, -0.95], [BR_X + 0.25, 0.3, -0.15], 1),                // cuerpo de la capota
+      G.transform(G.cylinder(0.25, -0.95, -0.15, 32), M4.multiply(M4.translation(BR_X, 0.3, 0), M4.rotationX(Math.PI / 2))), // lomo redondeado
+      G.box([BR_X - 0.21, 0.0, -2.75], [BR_X - 0.15, 0.3, -0.95], 1),              // raíles del bastidor
+      G.box([BR_X + 0.15, 0.0, -2.75], [BR_X + 0.21, 0.3, -0.95], 1),
+      G.box([BR_X - 0.25, 0.0, -2.75], [BR_X + 0.25, 0.04, -0.95], 1),             // base
+      G.box([BR_X - 0.25, 0.3, -2.78], [BR_X + 0.25, 0.4, -2.72], 1),              // tope del final
+    ])));
+    const railMesh = G.createMesh(gl, ...pack(G.merge([
+      G.transform(G.cylinder(0.012, -2.72, -0.98, 10), M4.multiply(M4.translation(BR_X - 0.09, 0.31, 0), M4.rotationX(Math.PI / 2))),
+      G.transform(G.cylinder(0.012, -2.72, -0.98, 10), M4.multiply(M4.translation(BR_X + 0.09, 0.31, 0), M4.rotationX(Math.PI / 2))),
+    ])));
+    const rackBalls = [{ x: BR_X, z: -1.45, tex: ballTex2 }, { x: BR_X, z: -1.69, tex: ballTex3 }];
+    // Suelo de la sala (moqueta), techo y paredes lejanas
+    const roomMesh = G.createMesh(gl, ...pack(G.merge([
+      G.plane(-12, -kb - 0.5, -LANE.approach - 6, LANE.endZ + 1, 1, 2, -0.012, 0.2),
+      G.plane(kb + 0.5, 12, -LANE.approach - 6, LANE.endZ + 1, 1, 2, -0.012, 0.2),
+      G.plane(-kb - 0.5, kb + 0.5, -LANE.approach - 6, -LANE.approach, 1, 1, -0.012, 0.2),
+      G.box([-12, CEIL, -LANE.approach - 6], [12, CEIL + 0.05, LANE.endZ + 1], 1),      // techo
+      G.box([-12, -0.5, -LANE.approach - 6.05], [12, CEIL, -LANE.approach - 6], 1),     // pared trasera (zona de asientos)
+      G.box([-12.05, -0.5, -LANE.approach - 6], [-12, CEIL, LANE.endZ + 1], 1), G.box([12, -0.5, -LANE.approach - 6], [12.05, CEIL, LANE.endZ + 1], 1),
+    ])));
+    // Luminarias: tiras LED continuas paralelas a las pistas (las dos centrales iluminan analíticamente)
+    const ROW_X = [0, -NEIGH, NEIGH, -2 * NEIGH, 2 * NEIGH], ROW_Y = CEIL - 0.08, ROW_Z0 = -LANE.approach - 2, ROW_Z1 = LANE.endZ + 0.5;   // una fila por pista
     const lights = [];
-    for (let z = -1; z < LANE.endZ; z += 3.0) for (const lx of [-1.9, 1.9]) lights.push(G.box([lx - 0.08, 4.55, z], [lx + 0.08, 4.6, z + 1.4], 1));
+    for (const lx of ROW_X) {
+      lights.push(G.box([lx - 0.07, ROW_Y - 0.03, ROW_Z0], [lx + 0.07, ROW_Y + 0.02, ROW_Z1], 1));
+    }
     const lightMesh = G.createMesh(gl, ...pack(G.merge(lights)));
-    // Marcas de la pista: flechas y puntos como geometría plana muy fina
+    const housingMesh = G.createMesh(gl, ...pack(G.merge(ROW_X.map((lx) => G.box([lx - 0.12, ROW_Y + 0.02, ROW_Z0 - 0.1], [lx + 0.12, CEIL, ROW_Z1 + 0.1], 1)))));
+    // Marcas de la pista: flechas (chevrones de nogal) y puntos
     const marks = [];
-    const bw = LANE.width / LANE.boards;
     for (const b of [5, 10, 15, 20, 25, 30, 35]) {
       const x = (b - 20) * bw, z = LANE.arrowsZ + Math.abs(b - 20) * 0.03;
-      marks.push(tri([x, 0.0012, z + 0.2], [x - 0.018, 0.0012, z], [x + 0.018, 0.0012, z]));
+      marks.push(tri([x, 0.0012, z + 0.16], [x - 0.016, 0.0012, z], [x + 0.016, 0.0012, z]));
     }
     for (const b of [3, 5, 8, 11, 14, 26, 29, 32, 35, 37]) {
-      const x = (b - 20) * bw;
-      marks.push(G.transform(G.sphere(0.012, 8, 4), M4.multiply(M4.translation(x, 0.0, LANE.dotsZ), M4.scaling(1, 0.08, 1))));
+      marks.push(G.transform(G.sphere(0.01, 8, 4), M4.multiply(M4.translation((b - 20) * bw, 0.0, LANE.dotsZ), M4.scaling(1, 0.08, 1))));
     }
     const markMesh = G.createMesh(gl, ...pack(G.merge(marks)));
-    const foulMesh = G.createMesh(gl, ...pack(G.box([-hw - gw, 0.0008, -0.01], [hw + gw, 0.0014, 0.01], 1)));
+    const foulMesh = G.createMesh(gl, ...pack(G.box([-hw - gw, 0.0008, -0.012], [hw + gw, 0.0016, 0.012], 1)));
     // Bolos y bola
-    const pinMesh = G.createMesh(gl, ...pack(G.lathe(R.PIN_PROFILE.map(([y, r]) => [y - PINC.comHeight, r]), 48)));
+    const pinMesh = G.createMesh(gl, ...pack(G.lathe(R.PIN_PROFILE.map(([y, r, v]) => [y - PINC.comHeight, r, v]), 36)));
+    const pinMeshLow = G.createMesh(gl, ...pack(G.lathe(R.PIN_PROFILE_LOW.map(([y, r, v]) => [y - PINC.comHeight, r, v]), 20)));
     const ballMesh = G.createMesh(gl, ...pack(G.sphere(BALLC.radius, 64, 32)));
     const quadMesh = fullscreenQuad(gl);
-    // Barra del pinsetter
+    const decalMesh = G.createMesh(gl, ...pack(G.quadXZ()));
+    // Barra del pinsetter (con labio de goma) y mesa con diez copas
     const sweepMesh = G.createMesh(gl, ...pack(G.merge([
-      G.box([-kb + 0.01, 0.015, -0.03], [kb - 0.01, 0.12, 0.03], 1),             // barra
-      G.box([-kb + 0.01, 0.12, -0.012], [kb - 0.01, 0.34, 0.012], 1),            // placa vertical
+      G.box([-kb + 0.01, 0.0, -0.03], [kb - 0.01, 0.1, 0.03], 1),                 // barra
+      G.box([-kb + 0.01, 0.1, -0.012], [kb - 0.01, 0.3, 0.012], 1),               // placa vertical
+      G.box([-kb + 0.025, 0.3, -0.015], [-kb + 0.05, 1.0, 0.015], 1), G.box([kb - 0.05, 0.3, -0.015], [kb - 0.025, 1.0, 0.015], 1), // brazos
     ])));
+    const rack = P.rackPositions();
+    const tableParts = [G.box([-hw - 0.08, 0.0, -0.17], [hw + 0.08, 0.08, 3 * LANE.rowSpacing + 0.17], 1)];
+    for (const q of rack) tableParts.push(G.transform(G.cylinder(0.046, -0.13, 0.0, 20), M4.translation(q.x, 0, q.z - LANE.headPinZ)));
+    const tableMesh = G.createMesh(gl, ...pack(G.merge(tableParts)));
 
     // ---------- objetivos de render ----------
     const SHADOW = (window.innerWidth || 1024) * (Math.min(window.devicePixelRatio || 1, 2)) > 1100 ? 2048 : 1024;
     const shadowRT = G.renderTarget(gl, SHADOW, SHADOW, { linear: false });
-    let reflRT = G.renderTarget(gl, 512, 512);
-    let sceneRT = G.renderTarget(gl, 16, 16);
+    const reflRT = G.renderTarget(gl, 512, 512);
+    const sceneRT = G.renderTarget(gl, 16, 16);
+    const bloomA = G.renderTarget(gl, 16, 16), bloomB = G.renderTarget(gl, 16, 16);
 
     // ---------- estado ----------
     const cam = { eye: [0, 1.4, -3.2], target: [0, 0.2, 6], fov: 55 * Math.PI / 180, view: null, proj: null, aspect: 1 };
+    const DECK_LIGHT = { y: 1.52, z: LANE.headPinZ - 0.72, half: 0.62, color: [70, 74, 86], r: 0.025 };   // radiancia (6000 K)
+    const ROW_L = [30, 28, 24.5];                                                 // radiancia de las tiras LED (3500 K)
     const light = {
-      dir: G.vec.norm3([0.2, 1.0, 0.22]), color: [2.6, 2.45, 2.2],              // luminarias del techo (cálidas); las sombras caen hacia la cámara
-      fill: G.vec.norm3([-0.4, 0.5, 0.75]), fillColor: [0.35, 0.38, 0.45],      // relleno frío desde el fondo
-      sky: [0.16, 0.17, 0.2], ground: [0.1, 0.075, 0.05],
-      deckPos: [0, 1.45, LANE.headPinZ - 0.6], deckColor: [5.5, 5.8, 6.2],      // foco frío sobre el pin deck
+      dir: G.vec.norm3([0.1, 1.0, -0.3]), color: [0.9, 0.85, 0.75],             // lavado general del techo (sombras hacia el foso)
+      fill: G.vec.norm3([-0.4, 0.5, 0.75]), fillColor: [0.28, 0.3, 0.36],        // relleno frío desde el fondo
+      sky: [0.2, 0.21, 0.25], ground: [0.11, 0.085, 0.06],
+      // Luces lineales: la fila sobre la pista que se dibuja y el foco de su pin deck (se desplazan con laneOffset)
+      tubeA: [0, ROW_Y, ROW_Z0, -DECK_LIGHT.half, DECK_LIGHT.y, DECK_LIGHT.z],
+      tubeB: [0, ROW_Y, ROW_Z1, DECK_LIGHT.half, DECK_LIGHT.y, DECK_LIGHT.z],
+      tubeColor: ROW_L.concat(DECK_LIGHT.color),
+      tubeRadius: [0.06, DECK_LIGHT.r],
+      exposure: 1.0,
     };
     let lightVP = M4.identity();
-    const opts = { reflections: true, shadows: true, post: true, pixelRatio: 1 };
-    let W = 1, H = 1;
+    const opts = { reflections: true, reflScale: 0.5, shadows: true, softShadows: true, post: true, bloom: true, neighbours: true, neighbourPins: true, neighbourFurniture: true, bloomK: 0.55, grain: 0.012 };
+    let W = 1, H = 1, frameNo = 0;
 
     function resize(w, h, dpr) {
       W = Math.max(1, Math.floor(w * dpr)); H = Math.max(1, Math.floor(h * dpr));
       canvas.width = W; canvas.height = H;
       G.resizeTarget(gl, sceneRT, W, H);
-      const rw = Math.max(256, Math.min(1024, Math.floor(W / 2))), rh = Math.max(256, Math.min(1024, Math.floor(H / 2)));
+      const rs = opts.reflScale || 0.5;
+      const rw = Math.max(192, Math.min(1024, Math.floor(W * rs))), rh = Math.max(192, Math.min(1024, Math.floor(H * rs)));
       G.resizeTarget(gl, reflRT, rw, rh);
+      G.resizeTarget(gl, bloomA, Math.max(32, W >> 2), Math.max(32, H >> 2));
+      G.resizeTarget(gl, bloomB, Math.max(32, W >> 2), Math.max(32, H >> 2));
       cam.aspect = W / H;
     }
 
     // ---------- utilidades de dibujo ----------
+    let laneOffset = 0;   // desplazamiento x de la pista que se dibuja (0 = la del jugador)
     function setCommon(prog, view, proj, clip) {
       gl.useProgram(prog.p);
       gl.uniformMatrix4fv(prog.u.uView, false, view);
@@ -2145,9 +2571,14 @@ const BowlingRenderer3D = (function () {
       gl.uniform3fv(prog.u.uFillColor, light.fillColor);
       gl.uniform3fv(prog.u.uSkyColor, light.sky);
       gl.uniform3fv(prog.u.uGroundColor, light.ground);
-      gl.uniform3fv(prog.u.uDeckLightPos, light.deckPos);
-      gl.uniform3fv(prog.u.uDeckLightColor, light.deckColor);
-      gl.uniform1f(prog.u.uExposure, 1.0);
+      const ta = light.tubeA.slice(), tb = light.tubeB.slice();
+      ta[0] += laneOffset; tb[0] += laneOffset; ta[3] += laneOffset; tb[3] += laneOffset;
+      gl.uniform3fv(prog.u.uTubeA, ta);
+      gl.uniform3fv(prog.u.uTubeB, tb);
+      gl.uniform3fv(prog.u.uTubeColor, light.tubeColor);
+      gl.uniform1fv(prog.u.uTubeRadius, light.tubeRadius);
+      gl.uniform1f(prog.u.uPcf, opts.softShadows ? 1 : 0);
+      gl.uniform1f(prog.u.uExposure, light.exposure);
       gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, shadowRT.tex);
       gl.uniform1i(prog.u.uShadowMap, 2);
       gl.uniform1f(prog.u.uShadowTexel, 1 / SHADOW);
@@ -2161,24 +2592,33 @@ const BowlingRenderer3D = (function () {
       gl.uniform1f(p.u.uMetal, mat.metal || 0);
       gl.uniform3fv(p.u.uEmissive, mat.emissive || [0, 0, 0]);
       gl.uniform1f(p.u.uAlpha, mat.alpha == null ? 1 : mat.alpha);
+      gl.uniform1f(p.u.uF0, mat.f0 || 0);
+      gl.uniform1f(p.u.uEmissiveMap, mat.emissiveMap ? 1 : 0);
+      gl.uniform1f(p.u.uSimple, mat.simple ? 1 : 0);
       gl.uniform2fv(p.u.uUvScale, mat.uvScale || [1, 1]);
       if (mat.map) { gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, mat.map); gl.uniform1i(p.u.uAlbedoMap, 0); gl.uniform1f(p.u.uUseMap, 1); }
       else gl.uniform1f(p.u.uUseMap, 0);
       G.bindMesh(gl, mesh, p); G.drawMesh(gl, mesh);
     }
     const MAT = {
-      pin: { albedo: [0.92, 0.92, 0.9], rough: 0.22 },
-      wall: { albedo: [0.035, 0.037, 0.045], rough: 0.45, metal: 0.1 },
+      pin: { albedo: [0.93, 0.93, 0.91], rough: 0.17, f0: 0.03, map: pinTex },
+      wall: { albedo: [0.03, 0.032, 0.038], rough: 0.5, metal: 0.05 },
+      plate: { albedo: [0.075, 0.072, 0.07], rough: 0.35, metal: 0.1 },
       pit: { albedo: [0.02, 0.02, 0.025], rough: 0.9 },
-      room: { albedo: [0.03, 0.028, 0.034], rough: 0.98 },
-      ceiling: { albedo: [0.03, 0.035, 0.05], rough: 1 },
-      lights: { albedo: [1, 1, 1], rough: 0.4, emissive: [3.5, 3.3, 2.8] },
-      marks: { albedo: [0.1, 0.07, 0.04], rough: 0.5 },
+      room: { albedo: [0.035, 0.03, 0.035], rough: 0.98, simple: true },
+      fascia: { albedo: [0.025, 0.027, 0.034], rough: 0.9, simple: true },
+      lights: { albedo: [1, 1, 1], rough: 0.4, emissive: ROW_L },
+      housing: { albedo: [0.2, 0.2, 0.2], rough: 0.6, metal: 0.4, simple: true },
+      marks: { albedo: [0.09, 0.06, 0.035], rough: 0.5 },
       foul: { albedo: [0.02, 0.02, 0.02], rough: 0.6 },
-      gutter: { albedo: [0.07, 0.072, 0.08], rough: 0.3, metal: 0.25 },
-      flat: { albedo: [0.05, 0.05, 0.055], rough: 0.6 },
-      sweep: { albedo: [0.32, 0.33, 0.36], rough: 0.45, metal: 0.6 },
-      neighbour: { albedo: [0.45, 0.33, 0.2], rough: 0.5 },
+      gutter: { albedo: [0.035, 0.036, 0.04], rough: 0.4, metal: 0.15 },
+      flat: { albedo: [0.04, 0.04, 0.045], rough: 0.6 },
+      sweep: { albedo: [0.3, 0.31, 0.34], rough: 0.4, metal: 0.6 },
+      table: { albedo: [0.14, 0.14, 0.15], rough: 0.5, metal: 0.3 },
+      capping: { albedo: [0.055, 0.055, 0.06], rough: 0.45, metal: 0.1 },
+      ballReturn: { albedo: [0.08, 0.085, 0.1], rough: 0.4, metal: 0.1 },
+      rail: { albedo: [0.75, 0.76, 0.78], rough: 0.25, metal: 0.9 },
+      maskPanel: { albedo: [0.35, 0.35, 0.37], rough: 0.7, emissive: [2.2, 2.2, 2.4], emissiveMap: true },
     };
 
     // ---------- pasadas ----------
@@ -2187,108 +2627,191 @@ const BowlingRenderer3D = (function () {
       const bz = state.ball ? state.ball.p[2] : 0;
       const z0 = Math.min(bz - 1.0, LANE.deckStartZ - 1.5), z1 = LANE.endZ + 0.3;
       const cz = (z0 + z1) / 2, half = (z1 - z0) / 2 + 0.5;
-      const center = [0, 0.2, cz];
+      const center = [0, 0.3, cz];
       const eye = [center[0] + light.dir[0] * 12, center[1] + light.dir[1] * 12, center[2] + light.dir[2] * 12];
       const view = M4.lookAt(eye, center, [0, 1, 0]);
-      const proj = M4.ortho(-1.6, 1.6, -half, half, 0.5, 30);
+      const proj = M4.ortho(-1.7, 1.7, -half, half, 0.5, 30);
       lightVP = M4.multiply(proj, view);
     }
+    function drawDepth(mesh, model) { gl.uniformMatrix4fv(progDepth.u.uModel, false, model); G.bindMesh(gl, mesh, progDepth); G.drawMesh(gl, mesh); }
     function drawCasters(state, forDepth, view, proj, clip) {
       // Bolos
       for (const pin of state.pins) {
         if (pin.state === 'pit' && pin.p[1] < -0.3) continue;
         const model = M4.fromQuat(pin.p, pin.q);
-        if (forDepth) { gl.uniformMatrix4fv(progDepth.u.uModel, false, model); G.bindMesh(gl, pinMesh, progDepth); G.drawMesh(gl, pinMesh); }
+        if (forDepth) drawDepth(pinMesh, model);
         else drawPin(model, pin, view, proj, clip);
       }
       // Bola
       if (state.ball && state.ball.visible) {
         const b = state.ball;
         const model = M4.fromQuat(b.p, b.q);
-        if (forDepth) { gl.uniformMatrix4fv(progDepth.u.uModel, false, model); G.bindMesh(gl, ballMesh, progDepth); G.drawMesh(gl, ballMesh); }
-        else {
-          setCommon(progBall, view, proj, clip); stdReady = null;
-          gl.uniformMatrix4fv(progBall.u.uModel, false, model);
-          gl.uniform1f(progBall.u.uRough, 0.12);
-          gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, ballTex); gl.uniform1i(progBall.u.uBallMap, 0);
-          G.bindMesh(gl, ballMesh, progBall); G.drawMesh(gl, ballMesh);
-        }
+        if (forDepth) drawDepth(ballMesh, model);
+        else drawBall(model, ballTex, view, proj, clip);
       }
-      if (state.sweep && !forDepth) {
-        setCommon(progStd, view, proj, clip); stdReady = null;
-        drawStd(sweepMesh, M4.translation(0, state.sweep.y, state.sweep.z), MAT.sweep);
+      // Mesa y barra del pinsetter
+      if (state.table && state.table.y != null) {
+        const model = M4.translation(0, state.table.y, LANE.headPinZ);
+        if (forDepth) drawDepth(tableMesh, model);
+        else { setCommon(progStd, view, proj, clip); stdReady = null; drawStd(tableMesh, model, MAT.table); }
+      }
+      if (state.sweep) {
+        const model = M4.translation(0, state.sweep.y, state.sweep.z);
+        if (forDepth) drawDepth(sweepMesh, model);
+        else { setCommon(progStd, view, proj, clip); stdReady = null; drawStd(sweepMesh, model, MAT.sweep); }
       }
       stdReady = null;
     }
     let stdReady = null;
-    function drawPin(model, pin, view, proj, clip) {
+    function drawPin(model, pin, view, proj, clip, mesh) {
+      const m = mesh || pinMesh;
       if (stdReady !== view) { setCommon(progStd, view, proj, clip); stdReady = view; }
       gl.uniformMatrix4fv(progStd.u.uModel, false, model);
-      // Blanco brillante con dos franjas rojas: el shader estándar no tiene franjas, usamos la textura de bolo
       gl.uniform3fv(progStd.u.uAlbedo, MAT.pin.albedo);
       gl.uniform1f(progStd.u.uRough, MAT.pin.rough);
       gl.uniform1f(progStd.u.uMetal, 0);
+      gl.uniform1f(progStd.u.uF0, MAT.pin.f0);
       gl.uniform3fv(progStd.u.uEmissive, [0, 0, 0]);
       gl.uniform1f(progStd.u.uAlpha, pin.alpha == null ? 1 : pin.alpha);
       gl.uniform2fv(progStd.u.uUvScale, [1, 1]);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, pinTex); gl.uniform1i(progStd.u.uAlbedoMap, 0); gl.uniform1f(progStd.u.uUseMap, 1);
-      G.bindMesh(gl, pinMesh, progStd); G.drawMesh(gl, pinMesh);
+      G.bindMesh(gl, m, progStd); G.drawMesh(gl, m);
     }
-    // Textura del bolo: blanco con franjas rojas en el cuello (v = altura normalizada)
-    const pinTex = (() => {
-      const c = document.createElement('canvas'); c.width = 64; c.height = 512;
-      const ctx = c.getContext('2d');
-      ctx.fillStyle = '#f7f6f2'; ctx.fillRect(0, 0, 64, 512);
-      const n = R.PIN_PROFILE.length;
-      const bandY = (h) => { // altura → fila de la textura (v crece con el índice del perfil)
-        let idx = 0; for (let i = 0; i < n; i++) if (R.PIN_PROFILE[i][0] <= h) idx = i;
-        return 512 * (idx / (n - 1));
-      };
-      ctx.fillStyle = '#d8232d';
-      for (const [h0, h1] of [[0.262, 0.278], [0.296, 0.312]]) ctx.fillRect(0, bandY(h0), 64, Math.max(3, bandY(h1) - bandY(h0)));
-      // Corona del logo
-      ctx.fillStyle = '#d8232d'; ctx.beginPath(); ctx.arc(32, bandY(0.14), 7, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#f7f6f2'; ctx.beginPath(); ctx.arc(32, bandY(0.14), 4, 0, Math.PI * 2); ctx.fill();
-      return G.texture2D(gl, c, { repeat: false, mipmap: true });
-    })();
+    function drawBall(model, tex, view, proj, clip) {
+      setCommon(progBall, view, proj, clip); stdReady = null;
+      gl.uniformMatrix4fv(progBall.u.uModel, false, model);
+      gl.uniform1f(progBall.u.uRough, 0.1);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(progBall.u.uBallMap, 0);
+      G.bindMesh(gl, ballMesh, progBall); G.drawMesh(gl, ballMesh);
+    }
 
-    function drawStatic(view, proj, clip, mirrored) {
-      // Pista
+    function drawLaneSurfaces(view, proj, clip, mirrored, offset) {
       setCommon(progLane, view, proj, clip);
-      gl.uniformMatrix4fv(progLane.u.uModel, false, M4.identity());
+      const model = M4.translation(offset, 0, 0);
+      gl.uniformMatrix4fv(progLane.u.uModel, false, model);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, woodTex); gl.uniform1i(progLane.u.uWood, 0);
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, reflRT.tex); gl.uniform1i(progLane.u.uReflection, 1);
       gl.uniformMatrix4fv(progLane.u.uReflVP, false, reflVP);
       gl.uniform1f(progLane.u.uOilEnd, LANE.oilLength);
-      gl.uniform1f(progLane.u.uReflStrength, mirrored || !opts.reflections ? 0 : 1);
+      gl.uniform1f(progLane.u.uLaneHalf, hw);
+      gl.uniform1f(progLane.u.uDeckStart, LANE.deckStartZ);
+      gl.uniform1f(progLane.u.uPitZ, LANE.pitZ);
+      gl.uniform1f(progLane.u.uBoard, bw);
+      gl.uniform1f(progLane.u.uCenterX, offset);
+      gl.uniform1f(progLane.u.uDeckDark, 1);
+      gl.uniform1f(progLane.u.uIsApproach, 0);
+      gl.uniform1f(progLane.u.uReflStrength, mirrored || !opts.reflections || offset !== 0 ? 0 : 1);
       gl.uniform2fv(progLane.u.uWoodScale, [1 / LANE.width, 1 / 3.0]);
       G.bindMesh(gl, laneMesh, progLane); G.drawMesh(gl, laneMesh);
-      // Aproximación (madera más clara, sin reflejo)
+      // Aproximación (arce más claro, mate, sin aceite ni reflejo)
       gl.uniform1f(progLane.u.uReflStrength, 0);
+      gl.uniform1f(progLane.u.uIsApproach, 1);
+      gl.uniform1f(progLane.u.uDeckDark, 0);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, approachTex);
       gl.uniform2fv(progLane.u.uWoodScale, [1 / (LANE.width + 2 * LANE.gutter), 1 / 3.0]);
       G.bindMesh(gl, approachMesh, progLane); G.drawMesh(gl, approachMesh);
-      // Pistas vecinas (mismo shader, sin reflejo)
-      gl.uniform2fv(progLane.u.uWoodScale, [1 / LANE.width, 1 / 3.0]);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, woodTex);
-      G.bindMesh(gl, neighbourMesh, progLane); G.drawMesh(gl, neighbourMesh);
-      // Resto con el material estándar
+    }
+    function drawLaneFurniture(view, proj, clip, offset, maskTexture) {
       setCommon(progStd, view, proj, clip);
-      drawStd(gutterMesh, M4.identity(), MAT.gutter);
-      drawStd(deckSideMesh, M4.identity(), MAT.flat);
-      drawStd(wallMesh, M4.identity(), MAT.wall);
+      const model = M4.translation(offset, 0, 0);
+      const full = offset === 0 || opts.neighbourFurniture;
+      if (full) {
+        drawStd(gutterMesh, model, MAT.gutter);
+        drawStd(deckSideMesh, model, MAT.flat);
+        drawStd(plateMesh, model, MAT.plate);
+        drawStd(markMesh, model, MAT.marks);
+        drawStd(foulMesh, model, MAT.foul);
+      }
+      drawStd(wallMesh, model, MAT.wall);
+      drawStd(maskMesh, model, MAT.wall);
+      drawStd(maskUv, model, Object.assign({}, MAT.maskPanel, { map: maskTexture }));
+      drawStd(cappingMesh, model, MAT.capping);
+    }
+    function drawNeighbourPins(view, proj, clip, offset) {
+      if (!opts.neighbourPins) return;
+      for (const q of rack) drawPin(M4.translation(q.x + offset, PINC.comHeight, q.z), { alpha: 1 }, view, proj, clip, pinMeshLow);
+      stdReady = null;
+    }
+    function drawStatic(view, proj, clip, mirrored) {
+      // Pista del jugador
+      laneOffset = 0;
+      drawLaneSurfaces(view, proj, clip, mirrored, 0);
+      drawLaneFurniture(view, proj, clip, 0, maskTex);
+      // Resto de la sala
       drawStd(roomMesh, M4.identity(), MAT.room);
+      drawStd(fasciaMesh, M4.identity(), MAT.fascia);
+      drawStd(housingMesh, M4.identity(), MAT.housing);
       drawStd(lightMesh, M4.identity(), MAT.lights);
-      drawStd(markMesh, M4.identity(), MAT.marks);
-      drawStd(foulMesh, M4.identity(), MAT.foul);
-      drawStd(maskMesh, M4.identity(), MAT.wall);
-      drawStd(maskUv, M4.identity(), { albedo: [0.55, 0.55, 0.58], rough: 0.7, map: maskTex, emissive: [0.08, 0.08, 0.1] });
+      drawStd(ballReturnMesh, M4.identity(), MAT.ballReturn);
+      drawStd(railMesh, M4.identity(), MAT.rail);
+      for (const rb of rackBalls) drawBall(M4.translation(rb.x, 0.31 + 0.1, rb.z), rb.tex, view, proj, clip);
+      // Pistas vecinas (misma geometría desplazada, con su propio foco de pin deck)
+      if (opts.neighbours) {
+        for (const [sgn, tex] of [[-1, maskTexL], [1, maskTexR]]) {
+          laneOffset = sgn * NEIGH;
+          drawLaneSurfaces(view, proj, clip, true, laneOffset);
+          drawLaneFurniture(view, proj, clip, laneOffset, tex);
+          drawNeighbourPins(view, proj, clip, laneOffset);
+        }
+        laneOffset = 0;
+      }
+    }
+    // Calcomanías planas: marcas de los bolos, marcas de rango, puntos de la aproximación y sombras de contacto
+    const staticDecals = [];
+    for (const q of rack) staticDecals.push({ x: q.x, z: q.z, sx: 0.0285, sz: 0.0285, color: [0.78, 0.78, 0.76], alpha: 0.9, soft: 0.75, shape: 0 });
+    for (const b of [10, 30]) for (const [z0, z1] of [[10.36, 11.28], [12.19, 13.1]]) staticDecals.push({ x: (b - 20) * bw, z: (z0 + z1) / 2, sx: bw * 0.5, sz: (z1 - z0) / 2, color: [0.0, 0.0, 0.0], alpha: 0.22, soft: 0.9, shape: 1 });
+    for (const b of [5, 10, 15, 20, 25, 30, 35]) staticDecals.push({ x: (b - 20) * bw, z: -0.08, sx: 0.011, sz: 0.011, color: [0.02, 0.02, 0.02], alpha: 0.9, soft: 0.6, shape: 0 });
+    for (const b of [10, 15, 20, 25, 30]) staticDecals.push({ x: (b - 20) * bw, z: -3.66, sx: 0.011, sz: 0.011, color: [0.02, 0.02, 0.02], alpha: 0.9, soft: 0.6, shape: 0 });
+    for (const b of [5, 10, 15, 20, 25, 30, 35]) staticDecals.push({ x: (b - 20) * bw, z: -4.4, sx: 0.011, sz: 0.011, color: [0.02, 0.02, 0.02], alpha: 0.9, soft: 0.6, shape: 0 });
+    function drawDecals(list, view, proj) {
+      gl.useProgram(progDecal.p);
+      gl.uniformMatrix4fv(progDecal.u.uView, false, view);
+      gl.uniformMatrix4fv(progDecal.u.uProj, false, proj);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false); gl.colorMask(true, true, true, false);
+      G.bindMesh(gl, decalMesh, progDecal);
+      for (const d of list) {
+        let model = M4.multiply(M4.translation(d.x, d.y == null ? 0.0015 : d.y, d.z), M4.scaling(d.sx, 1, d.sz));
+        if (d.rot) model = M4.multiply(M4.translation(d.x, d.y == null ? 0.0015 : d.y, d.z), M4.multiply(M4.rotationY(d.rot), M4.scaling(d.sx, 1, d.sz)));
+        gl.uniformMatrix4fv(progDecal.u.uModel, false, model);
+        gl.uniform3fv(progDecal.u.uColor, d.color);
+        gl.uniform1f(progDecal.u.uAlpha, d.alpha);
+        gl.uniform1f(progDecal.u.uSoft, d.soft);
+        gl.uniform1f(progDecal.u.uShape, d.shape || 0);
+        G.drawMesh(gl, decalMesh);
+      }
+      gl.disable(gl.BLEND); gl.depthMask(true); gl.colorMask(true, true, true, true);
+    }
+    function contactShadows(state) {
+      const out = [];
+      for (const pin of state.pins) {
+        if (pin.state === 'pit' || pin.p[1] < -0.02) continue;
+        const q = pin.q, ax = 2 * (q[0] * q[1] + q[2] * q[3]), ay = 1 - 2 * (q[0] * q[0] + q[2] * q[2]), az = 2 * (q[1] * q[2] - q[0] * q[3]);
+        const up = Math.max(0, Math.min(1, ay));
+        const height = pin.p[1] - PINC.comHeight * up;           // altura del punto más bajo aprox.
+        const fade = Math.max(0, 1 - Math.max(0, height) / 0.25);
+        if (fade <= 0.02) continue;
+        const horiz = Math.hypot(ax, az);
+        const len = 0.1 + 0.16 * (1 - up);
+        const ang = horiz > 1e-3 ? Math.atan2(ax, az) : 0;
+        // Centro del bolo tumbado: desplazado del centro de masas hacia la base
+        const cx = pin.p[0] - ax * (PINC.comHeight - PINC.height / 2) * (1 - up), cz = pin.p[2] - az * (PINC.comHeight - PINC.height / 2) * (1 - up);
+        out.push({ x: cx, z: cz, sx: 0.095 + 0.02 * (1 - up), sz: len, rot: ang, color: [0, 0, 0], alpha: 0.5 * fade, soft: 0.1, shape: 0 });
+      }
+      if (state.ball && state.ball.visible) {
+        const b = state.ball;
+        const h = b.p[1] - BALLC.radius;
+        const fade = Math.max(0, 1 - Math.max(0, h) / 0.3);
+        if (fade > 0.02 && b.p[1] > -0.05) out.push({ x: b.p[0], z: b.p[2], sx: 0.15 + h * 0.3, sz: 0.15 + h * 0.3, color: [0, 0, 0], alpha: 0.6 * fade, soft: 0.15, shape: 0 });
+      }
+      for (const rb of rackBalls) out.push({ x: rb.x, z: rb.z, y: 0.045, sx: 0.14, sz: 0.14, color: [0, 0, 0], alpha: 0.5, soft: 0.2, shape: 0 });
+      return out;
     }
 
     let reflVP = M4.identity();
     let shadowKey = '';
     function render(state) {
       if (W < 2) return;
+      frameNo++;
       cam.view = M4.lookAt(cam.eye, cam.target, [0, 1, 0]);
       cam.proj = M4.perspective(cam.fov, cam.aspect, 0.2, 60);
       const noClip = [0, 0, 0, 1];
@@ -2322,44 +2845,73 @@ const BowlingRenderer3D = (function () {
         drawCasters(state, false, viewM, projM, [0, 1, 0, -0.002]);
         cam.eye = savedEye;
       }
-      // 3) Escena principal
+      // 3) Escena principal (alfa = brillo para el bloom)
       gl.bindFramebuffer(gl.FRAMEBUFFER, opts.post ? sceneRT.fb : null);
       gl.viewport(0, 0, W, H);
-      gl.clearColor(0.02, 0.025, 0.04, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.clearColor(0.02, 0.025, 0.04, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
       gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE); gl.frontFace(gl.CW); gl.cullFace(gl.BACK);
       drawStatic(cam.view, cam.proj, noClip, false);
+      drawDecals(staticDecals.concat(contactShadows(state)), cam.view, cam.proj);
       drawCasters(state, false, cam.view, cam.proj, noClip);
       if (state.guide && state.guide.length > 1) drawGuide(state.guide, cam.view, cam.proj);
-      // 4) Post-proceso
+      // 4) Bloom y post-proceso
       if (opts.post) {
+        gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadMesh);
+        const quad = (prog) => { gl.useProgram(prog.p); gl.enableVertexAttribArray(prog.a.aPos); gl.vertexAttribPointer(prog.a.aPos, 2, gl.FLOAT, false, 0, 0); };
+        if (opts.bloom) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, bloomA.fb); gl.viewport(0, 0, bloomA.w, bloomA.h);
+          quad(progBright);
+          gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneRT.tex); gl.uniform1i(progBright.u.uTex, 0);
+          gl.uniform2f(progBright.u.uTexel, 1 / W, 1 / H);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+          for (const [src, dst, dir] of [[bloomA, bloomB, [1 / bloomA.w, 0]], [bloomB, bloomA, [0, 1 / bloomA.h]]]) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb); gl.viewport(0, 0, dst.w, dst.h);
+            quad(progBlur);
+            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src.tex); gl.uniform1i(progBlur.u.uTex, 0);
+            gl.uniform2f(progBlur.u.uDir, dir[0], dir[1]);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+          }
+        }
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.viewport(0, 0, W, H);
-        gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
-        gl.useProgram(progPost.p);
+        quad(progPost);
         gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneRT.tex); gl.uniform1i(progPost.u.uTex, 0);
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bloomA.tex); gl.uniform1i(progPost.u.uBloom, 1);
         gl.uniform2f(progPost.u.uTexel, 1 / W, 1 / H);
-        gl.uniform1f(progPost.u.uVignette, 0.35);
-        gl.bindBuffer(gl.ARRAY_BUFFER, quadMesh);
-        gl.enableVertexAttribArray(progPost.a.aPos); gl.vertexAttribPointer(progPost.a.aPos, 2, gl.FLOAT, false, 0, 0);
+        gl.uniform1f(progPost.u.uVignette, 0.32);
+        gl.uniform1f(progPost.u.uBloomK, opts.bloom ? opts.bloomK : 0);
+        gl.uniform1f(progPost.u.uGrain, opts.grain);
+        gl.uniform1f(progPost.u.uTime, (frameNo % 97) * 0.37);
         gl.drawArrays(gl.TRIANGLES, 0, 6);
         gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
       }
     }
     function drawStaticMirror(view, proj, clip) {
-      // En el reflejo no dibujamos la pista (es el espejo) ni la aproximación
+      // En el reflejo no se dibujan las superficies de la pista (son el espejo)
       setCommon(progStd, view, proj, clip);
       drawStd(wallMesh, M4.identity(), MAT.wall);
+      drawStd(plateMesh, M4.identity(), MAT.plate);
       drawStd(roomMesh, M4.identity(), MAT.room);
-      drawStd(lightMesh, M4.identity(), MAT.lights);
+      drawStd(fasciaMesh, M4.identity(), MAT.fascia);
+      drawStd(housingMesh, M4.identity(), MAT.housing);
       drawStd(maskMesh, M4.identity(), MAT.wall);
-      drawStd(maskUv, M4.identity(), { albedo: [0.55, 0.55, 0.58], rough: 0.7, map: maskTex, emissive: [0.08, 0.08, 0.1] });
+      drawStd(maskUv, M4.identity(), Object.assign({}, MAT.maskPanel, { map: maskTex }));
       drawStd(gutterMesh, M4.identity(), MAT.gutter);
+      drawStd(cappingMesh, M4.identity(), MAT.capping);
+      if (opts.neighbours) {
+        for (const [sgn, tex] of [[-1, maskTexL], [1, maskTexR]]) {
+          laneOffset = sgn * NEIGH;
+          drawLaneFurniture(view, proj, clip, laneOffset, tex);
+        }
+        laneOffset = 0;
+      }
     }
     // Guía de puntería: puntos sobre la pista
     let guideMesh = null;
     function drawGuide(pts, view, proj) {
       setCommon(progStd, view, proj, [0, 0, 0, 1]);
-      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false); gl.colorMask(true, true, true, false);
       if (!guideMesh) guideMesh = G.createMesh(gl, ...pack(G.transform(G.sphere(1, 10, 5), M4.scaling(1, 0.15, 1))));
       const n = pts.length;
       for (let i = 0; i < n; i += 2) {
@@ -2368,7 +2920,7 @@ const BowlingRenderer3D = (function () {
         const col = p.gutter ? [1.0, 0.3, 0.3] : [0.3, 0.8, 1.0];
         drawStd(guideMesh, M4.multiply(M4.translation(p.x, 0.004, p.z), M4.scaling(0.028, 0.028, 0.028)), { albedo: col, rough: 1, emissive: [col[0] * 0.6, col[1] * 0.6, col[2] * 0.6], alpha: 0.85 * (1 - t * 0.8) });
       }
-      gl.disable(gl.BLEND); gl.depthMask(true);
+      gl.disable(gl.BLEND); gl.depthMask(true); gl.colorMask(true, true, true, true);
     }
 
     // ---------- helpers ----------
@@ -2388,6 +2940,16 @@ const BowlingRenderer3D = (function () {
 
     return {
       gl, cam, light, opts, resize, render,
+      laneNumber: LANE_NUMBER,
+      /** Actualiza el texto de la unidad de enmascaramiento (nombre del jugador, strike...). */
+      setLaneStatus(status) {
+        R.makeMaskTexture(1024, 512, LANE_NUMBER, status, maskCanvas);
+        gl.bindTexture(gl.TEXTURE_2D, maskTex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, maskCanvas);
+        gl.generateMipmap(gl.TEXTURE_2D);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+      },
       /** Convierte un punto de pantalla (px CSS) en la coordenada x sobre el suelo (y = 0) para colocar la bola. */
       groundFromScreen(sx, sy, cssW, cssH) {
         const nx = (sx / cssW) * 2 - 1, ny = 1 - (sy / cssH) * 2;
@@ -2412,7 +2974,7 @@ const BowlingRenderer3D = (function () {
 </script>
 <script id="main">
 /* ==========================================================================
-   Juego: cámara, render, entrada, flujo de la partida y marcador.
+   Juego: flujo de la partida, marcador, pinsetter y repetición.
    ========================================================================== */
 (function () {
   'use strict';
@@ -2432,11 +2994,12 @@ const BowlingRenderer3D = (function () {
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* almacenamiento no disponible */ } },
   };
   const reducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  void easeOut; void easeInOut;
 
   const canvas = $('game');
   const stage = $('stage');
   const el = {
-    status: $('status'), pinsChip: $('pins-chip'), hint: $('hint'),
+    status: $('status'), pinsChip: $('pins-chip'), hint: $('hint'), replayChip: $('replay-chip'),
     spinLabel: $('spin-label'), spinFill: $('spin-fill'), spinLeft: $('spin-left'), spinRight: $('spin-right'),
     power: $('power'), powerFill: $('power-fill'),
     message: $('message'), live: $('live'), liveTurn: $('live-turn'), scoreboard: $('scoreboard'),
@@ -2447,13 +3010,25 @@ const BowlingRenderer3D = (function () {
     btnHelpClose: $('btn-help-close'), btnChange: $('btn-change'), btnAgain: $('btn-again'), btnSetupCancel: $('btn-setup-cancel'),
   };
 
-  // ------------------------------------------------------------ lienzo
+  // ------------------------------------------------------------ lienzo y calidad
   let W = 0, H = 0, DPR = 1;
+  const quality = { tier: 2, acc: 0, n: 0, lastChange: 0, time: 0, auto: true };
+  const QUALITY = [
+    { dprCap: 1.0, bloom: false, reflections: false, reflScale: 0.3, grain: 0, softShadows: false, neighbourPins: false, neighbourFurniture: false },
+    { dprCap: 1.3, bloom: true, reflections: true, reflScale: 0.35, grain: 0.01, softShadows: true, neighbourPins: false, neighbourFurniture: true },
+    { dprCap: 2.0, bloom: true, reflections: true, reflScale: 0.5, grain: 0.012, softShadows: true, neighbourPins: true, neighbourFurniture: true },
+  ];
+  function applyQuality() {
+    const q = QUALITY[quality.tier];
+    if (R3) Object.assign(R3.opts, { bloom: q.bloom, reflections: q.reflections, reflScale: q.reflScale, grain: q.grain, softShadows: q.softShadows, neighbourPins: q.neighbourPins, neighbourFurniture: q.neighbourFurniture });
+    resize();
+  }
   function resize() {
     const r = stage.getBoundingClientRect();
     W = Math.max(1, Math.round(r.width));
     H = Math.max(1, Math.round(r.height));
-    DPR = Math.min(window.devicePixelRatio || 1, W < 700 ? 1.5 : 2);
+    const cap = Math.min(QUALITY[quality.tier].dprCap, W < 700 ? 1.5 : 2);
+    DPR = Math.min(window.devicePixelRatio || 1, cap);
     if (R3) R3.resize(W, H, DPR);
     else { canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR); }
     canvas2d.width = Math.round(W * DPR); canvas2d.height = Math.round(H * DPR);
@@ -2462,13 +3037,47 @@ const BowlingRenderer3D = (function () {
   if (window.ResizeObserver) new ResizeObserver(resize).observe(stage);
   window.addEventListener('resize', resize);
   window.addEventListener('orientationchange', () => setTimeout(resize, 120));
+  /** Escalado automático de calidad según el tiempo real por fotograma (ventanas de ~1 s, con histéresis). */
+  function qualitySample(dt) {
+    if (!quality.auto || !R3) return;
+    quality.time += dt; quality.acc += dt; quality.n++;
+    if (quality.n < 60) return;
+    const avg = quality.acc / quality.n;
+    quality.acc = 0; quality.n = 0;
+    if (avg > 1 / 30 && quality.tier > 0 && quality.time - quality.lastChange > 2) { quality.tier--; quality.lastChange = quality.time; applyQuality(); }
+    else if (avg < 1 / 57 && quality.tier < 2 && quality.time - quality.lastChange > 12) { quality.tier++; quality.lastChange = quality.time; applyQuality(); }
+  }
 
   // ------------------------------------------------------------ cámara: sacudida (la cámara 3D vive en camState, parte B)
   const cam = { shake: 0, sx: 0, sy: 0 };
 
+  // ------------------------------------------------------------ pinsetter (posiciones de la barra y de la mesa)
+  const MACHINE = {
+    barRest: { y: 1.15, z: LANE.deckStartZ + 0.12 }, barGuard: { y: 0.0, z: LANE.deckStartZ - 0.25 }, barEnd: { y: 0.0, z: LANE.pitZ + 0.15 },
+    tableRest: 1.3, tableDown: 0.42, tableLift: 0.78,
+    barSpeed: 2.6, tableSpeed: 1.15,
+  };
+  const machine = {
+    bar: { y: MACHINE.barRest.y, z: MACHINE.barRest.z }, table: { y: MACHINE.tableRest },
+    barTarget: MACHINE.barRest, tableTarget: MACHINE.tableRest, guard: false,
+  };
+  function moveToward(v, target, maxStep) { const d = target - v; return Math.abs(d) <= maxStep ? target : v + Math.sign(d) * maxStep; }
+  function machineUpdate(dt) {
+    const bt = machine.barTarget;
+    const step = MACHINE.barSpeed * dt;
+    // La barra baja/sube primero y después recorre la pista
+    if (Math.abs(machine.bar.y - bt.y) > 1e-4 && (bt.y < machine.bar.y || Math.abs(machine.bar.z - bt.z) < 1e-3)) machine.bar.y = moveToward(machine.bar.y, bt.y, step);
+    else machine.bar.z = moveToward(machine.bar.z, bt.z, step);
+    machine.table.y = moveToward(machine.table.y, machine.tableTarget, MACHINE.tableSpeed * dt);
+  }
+  function machineReset() {
+    machine.bar.y = MACHINE.barRest.y; machine.bar.z = MACHINE.barRest.z; machine.table.y = MACHINE.tableRest;
+    machine.barTarget = MACHINE.barRest; machine.tableTarget = MACHINE.tableRest; machine.guard = false;
+  }
+
   // ------------------------------------------------------------ estado del juego
   const game = {
-    state: 'setup',           // setup | aim | rolling | result | sweep | over
+    state: 'setup',           // setup | aim | rolling | replay | result | sweep | over | paused
     players: [],              // { name, rolls: [] }
     current: 0,
     world: null,
@@ -2479,14 +3088,17 @@ const BowlingRenderer3D = (function () {
     timer: 0,
     timeScale: 1, slowmo: 0,
     fast: false,              // modo rápido para pruebas automáticas
+    hurry: false,             // el jugador ha acelerado: sin repetición
     seed: 1,
     sweep: null,
+    replay: null,
+    rec: [],                  // instantáneas de la jugada para la repetición
+    pending: null,            // resultado pendiente de mostrar tras la repetición
     rack: { drop: 0, t: 0, dropping: false },
-    stats: { strikes: 0, spares: 0, gutters: 0 },
+    stats: { strikes: 0, spares: 0, gutters: 0, replays: 0 },
     keys: new Set(),
   };
   const particles = [];
-  const floating = [];
 
   // ------------------------------------------------------------ mensajes
   let msgTimer = 0;
@@ -2526,6 +3138,8 @@ const BowlingRenderer3D = (function () {
     el.spinLeft.setAttribute('aria-disabled', game.spin <= -1 ? 'true' : 'false');
     el.spinRight.setAttribute('aria-disabled', game.spin >= 1 ? 'true' : 'false');
   }
+  /** Texto de la unidad de enmascaramiento (pantalla sobre los bolos). */
+  function laneStatus(status) { if (R3 && R3.setLaneStatus) { try { R3.setLaneStatus(status); } catch (e) { /* opcional */ } } }
 
   // ------------------------------------------------------------ sonido
   let soundOn = store.get('bowling.sound', true);
@@ -2583,6 +3197,7 @@ const BowlingRenderer3D = (function () {
     updateScoreboard();
   }
   function updateScoreboard() {
+    const afterRoll = game.state === 'result' || game.state === 'sweep' || game.state === 'replay';
     game.players.forEach((p, pi) => {
       const st = S.analyze(p.rolls);
       const nextFrame = st.next ? st.next.frame : -1;
@@ -2596,7 +3211,7 @@ const BowlingRenderer3D = (function () {
           spans[k].className = l === 'X' ? 'x' : l === '/' ? 'sp' : '';
         });
         cell.querySelector('.sb-total').textContent = fr.cumulative == null ? '' : String(fr.cumulative);
-        const hiFrame = (game.state === 'result' || game.state === 'sweep') && pi === game.current && game.rollInfo ? game.rollInfo.frame : nextFrame;
+        const hiFrame = afterRoll && pi === game.current && game.rollInfo ? game.rollInfo.frame : nextFrame;
         cell.classList.toggle('current', pi === game.current && f === hiFrame && game.state !== 'over');
       });
       const sum = el.scoreboard.querySelector(`.sb-sum[data-player="${pi}"]`);
@@ -2615,11 +3230,12 @@ const BowlingRenderer3D = (function () {
   function startGame(names) {
     game.players = names.map((n) => ({ name: n, rolls: [] }));
     game.current = 0;
-    game.stats = { strikes: 0, spares: 0, gutters: 0 };
+    game.stats = { strikes: 0, spares: 0, gutters: 0, replays: 0 };
     game.seed = game.seedOverride || ((Date.now() % 100000) | 1);
     game.seedOverride = null;
     game.slowmo = 0; cam.shake = 0; cam.sx = 0; cam.sy = 0; particles.length = 0; camReset();
-    game.timer = 0; game.sweep = null; game.lastRoll = null; game.lastThrow = null; game.resumeState = null;
+    game.timer = 0; game.sweep = null; game.replay = null; game.pending = null; game.rec = []; game.lastRoll = null; game.lastThrow = null; game.resumeState = null;
+    machineReset();
     Sound.rollStop();
     buildScoreboard();
     el.overlaySetup.classList.remove('open');
@@ -2634,19 +3250,19 @@ const BowlingRenderer3D = (function () {
   function beginAim(fullRack) {
     const p = game.players[game.current];
     const st = S.analyze(p.rolls);
+    const hadRoll = !!game.world && game.world.ball.active;
     if (fullRack || !game.world) {
       game.world = P.createWorld(game.seed++);
-      game.rack = { drop: 1, t: 0, dropping: true };
-      for (const pin of game.world.pins) pin.alpha = 1;
     } else {
       // El pinsetter vuelve a colocar en su marca los bolos que quedaron en pie
       const standing = game.world.pins.filter((q) => P.isStanding(q)).map((q) => ({ id: q.id, x: RACK[q.id].x, z: RACK[q.id].z }));
       game.world = P.createWorld(game.seed++, standing);
-      game.rack = { drop: 0, t: 0, dropping: false };
-      for (const pin of game.world.pins) pin.alpha = 1;
     }
+    for (const pin of game.world.pins) pin.alpha = 1;
+    game.rack = { drop: 0, t: 0, dropping: false };
+    machine.barTarget = MACHINE.barRest; machine.tableTarget = MACHINE.tableRest; machine.guard = false;
     game.state = 'aim';
-    game.rollInfo = { frame: st.next.frame, roll: st.next.roll, pinsBefore: st.next.pinsStanding, hitAny: false, slowDone: false };
+    game.rollInfo = { frame: st.next.frame, roll: st.next.roll, pinsBefore: st.next.pinsStanding, hitAny: false, slowDone: false, firstHitT: null };
     game.power = { active: false, value: 0, t: 0 };
     el.power.classList.remove('visible');
     el.powerFill.style.width = '0%';
@@ -2654,9 +3270,13 @@ const BowlingRenderer3D = (function () {
     game.aimAngle = 0;
     game.timeScale = 1;
     game.skip = false;
+    game.hurry = false;
+    game.rec = [];
     setStatus();
     updateScoreboard();
     el.hint.style.visibility = 'visible';
+    laneStatus({ line1: p.name.toUpperCase(), line2: `CUADRO ${st.next.frame + 1} · TIRO ${st.next.roll + 1}` });
+    if (hadRoll && !game.fast) Sound.ballReturn();
   }
 
   /** Lanza la bola con los parámetros dados (desde el gesto, el teclado o la API). */
@@ -2673,7 +3293,10 @@ const BowlingRenderer3D = (function () {
     game.rollInfo.hitAny = false;
     game.rollInfo.slowDone = false;
     game.rollInfo.gutter = false;
+    game.rollInfo.firstHitT = null;
+    game.rec = [];
     Sound.rollStart();
+    Sound.release(params.speed);
     return true;
   }
 
@@ -2686,6 +3309,7 @@ const BowlingRenderer3D = (function () {
           addShake(Math.min(1, e.impact / 7) * 6);
           if (!game.rollInfo.slowDone && !reducedMotion && !game.fast) { game.slowmo = 0.32; game.rollInfo.slowDone = true; }
           game.rollInfo.hitAny = true;
+          if (game.rollInfo.firstHitT == null) game.rollInfo.firstHitT = w.time;
         } else {
           Sound.pinHit(e.impact, false);
         }
@@ -2696,18 +3320,30 @@ const BowlingRenderer3D = (function () {
         Sound.rollStop();
         Sound.thud(0.8);
         addShake(3);
+        // La barra baja a la posición de guarda en cuanto la bola entra en el foso
+        if (!game.fast) { machine.guard = true; machine.barTarget = MACHINE.barGuard; Sound.sweepDrop(); }
       } else if (e.type === 'wall') {
-        Sound.thud(Math.min(1, e.impact / 6) * (e.ball ? 1 : 0.6));
+        Sound.thud(Math.min(1, e.impact / 6) * (e.ball ? 1 : 0.6), !e.ball);
         if (e.ball) addShake(2);
       } else if (e.type === 'floor') {
-        Sound.pinHit(e.impact * 0.6, false);
+        Sound.pinFloor(e.impact);
       } else if (e.type === 'pit-pin') {
-        Sound.thud(0.3);
+        Sound.pitThud(0.4);
       } else if (e.type === 'stopped') {
         Sound.rollStop();
       }
     }
-    void w;
+  }
+
+  /** Instantánea del mundo para la repetición. */
+  function recordSnapshot() {
+    const w = game.world, b = w.ball;
+    if (game.fast || reducedMotion) return;
+    if (b.p[2] < LANE.headPinZ - 4.5 && !game.rollInfo.hitAny) return;
+    const pins = new Float32Array(w.pins.length * 7);
+    w.pins.forEach((p, i) => { pins[i * 7] = p.p[0]; pins[i * 7 + 1] = p.p[1]; pins[i * 7 + 2] = p.p[2]; pins[i * 7 + 3] = p.q[0]; pins[i * 7 + 4] = p.q[1]; pins[i * 7 + 5] = p.q[2]; pins[i * 7 + 6] = p.q[3]; });
+    game.rec.push({ t: w.time, ball: [b.p[0], b.p[1], b.p[2], b.q[0], b.q[1], b.q[2], b.q[3]], visible: b.active && !(b.inPit && (b.pitT > 1.2 || b.p[1] < -0.25)), pins, bar: [machine.bar.y, machine.bar.z] });
+    if (game.rec.length > 420) game.rec.shift();
   }
 
   function finishRoll() {
@@ -2729,12 +3365,9 @@ const BowlingRenderer3D = (function () {
       else if (run === 3) sub = '¡Pavo!';
       else if (run >= 4) sub = `¡${run} seguidos!`;
       game.stats.strikes++;
-      Sound.strike();
-      spawnConfetti();
     } else if (isSpare) {
       text = '¡SPARE!';
       game.stats.spares++;
-      Sound.spare();
     } else if (info.gutter && knocked === 0) {
       text = '¡Canal!'; minor = true;
       game.stats.gutters++;
@@ -2746,12 +3379,67 @@ const BowlingRenderer3D = (function () {
       if (info.roll === 0 && isSplit(summary.standingIds)) sub = `Split ${summary.standingIds.join('-')}`;
       else if (info.roll === 1 && info.frame < 9) sub = 'Cuadro abierto';
     }
-    showMessage(text, sub, minor);
-    game.state = 'result';
-    game.timer = game.fast ? 0.05 : (isStrike ? 1.7 : 1.3);
     game.lastRoll = { knocked, isStrike, isSpare, gutter: !!info.gutter, standing: summary.standingIds, gameOver: st.gameOver };
+    game.pending = { text, sub, minor, isStrike, isSpare, timer: game.fast ? 0.05 : (isStrike ? 1.7 : 1.3) };
     updateScoreboard();
     setStatus(true);
+    // Repetición a cámara lenta desde la cámara de los bolos (solo strikes, salvo modo rápido, prisa o movimiento reducido)
+    const canReplay = isStrike && !game.fast && !reducedMotion && !game.hurry && info.firstHitT != null && game.rec.length > 12;
+    if (canReplay) startReplay(); else showResult();
+  }
+  function showResult() {
+    const r = game.pending;
+    game.pending = null;
+    game.replay = null;
+    el.replayChip.hidden = true;
+    if (!r) { game.state = 'result'; game.timer = 0.05; return; }
+    if (r.isStrike) { Sound.strike(); spawnConfetti(); laneStatus({ line1: '¡STRIKE!', color: '#f5b942', big: true }); }
+    else if (r.isSpare) { Sound.spare(); laneStatus({ line1: '¡SPARE!', color: '#38bdf8', big: true }); }
+    showMessage(r.text, r.sub, r.minor);
+    game.state = 'result';
+    game.timer = r.timer;
+    updateScoreboard();
+  }
+  /** Repetición: reproduce las instantáneas grabadas desde la cámara lateral de los bolos a cámara lenta. */
+  function startReplay() {
+    const rec = game.rec;
+    const t0 = Math.max(rec[0].t, game.rollInfo.firstHitT - 0.45);
+    const t1 = Math.min(rec[rec.length - 1].t, game.rollInfo.firstHitT + 1.55);
+    if (t1 - t0 < 0.5) { showResult(); return; }
+    game.replay = { frames: rec, t: t0, t0, t1, speed: 0.4, hold: 0.35, idx: 0 };
+    game.state = 'replay';
+    game.stats.replays++;
+    el.replayChip.hidden = false;
+    el.live.textContent = 'Repetición a cámara lenta.';
+    laneStatus({ line1: 'REPETICIÓN', color: '#ff4d6d', big: true });
+    camCut();
+  }
+  function replayUpdate(dt) {
+    const r = game.replay;
+    if (!r) { showResult(); return; }
+    r.t += dt * r.speed;
+    if (r.t >= r.t1) { r.hold -= dt; if (r.hold <= 0) showResult(); }
+  }
+  /** Fotograma interpolado de la repetición. */
+  function replayFrame() {
+    const r = game.replay;
+    const f = r.frames;
+    const t = Math.min(r.t, r.t1);
+    while (r.idx < f.length - 2 && f[r.idx + 1].t <= t) r.idx++;
+    const a = f[r.idx], b = f[Math.min(f.length - 1, r.idx + 1)];
+    const k = b.t > a.t ? clamp((t - a.t) / (b.t - a.t), 0, 1) : 0;
+    const lerpQ = (ax, ay, az, aw, bx, by, bz, bw) => {
+      let d = ax * bx + ay * by + az * bz + aw * bw; let s = 1;
+      if (d < 0) s = -1;
+      const q = [ax + (bx * s - ax) * k, ay + (by * s - ay) * k, az + (bz * s - az) * k, aw + (bw * s - aw) * k];
+      const l = Math.hypot(q[0], q[1], q[2], q[3]) || 1; return [q[0] / l, q[1] / l, q[2] / l, q[3] / l];
+    };
+    const pins = game.world.pins.map((p, i) => {
+      const A = a.pins, B = b.pins, o = i * 7;
+      return { p: [A[o] + (B[o] - A[o]) * k, A[o + 1] + (B[o + 1] - A[o + 1]) * k, A[o + 2] + (B[o + 2] - A[o + 2]) * k], q: lerpQ(A[o + 3], A[o + 4], A[o + 5], A[o + 6], B[o + 3], B[o + 4], B[o + 5], B[o + 6]), state: p.state, alpha: 1 };
+    });
+    const ball = { p: [a.ball[0] + (b.ball[0] - a.ball[0]) * k, a.ball[1] + (b.ball[1] - a.ball[1]) * k, a.ball[2] + (b.ball[2] - a.ball[2]) * k], q: lerpQ(a.ball[3], a.ball[4], a.ball[5], a.ball[6], b.ball[3], b.ball[4], b.ball[5], b.ball[6]), visible: a.visible };
+    return { pins, ball, bar: { y: a.bar[0] + (b.bar[0] - a.bar[0]) * k, z: a.bar[1] + (b.bar[1] - a.bar[1]) * k }, progress: (t - r.t0) / Math.max(0.1, r.t1 - r.t0) };
   }
 
   /** Strikes consecutivos que terminan en el último tiro (para «doble», «pavo»...). */
@@ -2785,6 +3473,8 @@ const BowlingRenderer3D = (function () {
     return seen.size < ids.length;
   }
 
+  /** Ciclo del pinsetter. Con bolos en pie: la mesa baja, los eleva, la barra barre la madera caída y la mesa los vuelve a dejar.
+      Rack completo: la barra barre todo y la mesa baja con diez bolos nuevos. */
   function startSweep() {
     const p = game.players[game.current];
     const st = S.analyze(p.rolls);
@@ -2793,10 +3483,30 @@ const BowlingRenderer3D = (function () {
     let nextPlayer = game.current;
     if (frameDone) nextPlayer = (game.current + 1) % game.players.length;
     const allOver = game.players.every((q) => S.analyze(q.rolls).gameOver);
-    const fullRack = allOver ? false : (nextPlayer !== game.current || S.analyze(game.players[nextPlayer].rolls).next.pinsStanding === 10);
-    game.sweep = { t: 0, fullRack, nextPlayer, allOver, duration: game.fast ? 0.08 : (fullRack ? 1.4 : 1.0) };
+    const fullRack = allOver ? true : (nextPlayer !== game.current || S.analyze(game.players[nextPlayer].rolls).next.pinsStanding === 10);
+    const anyStanding = game.world.pins.some((q) => P.isStanding(q));
+    const pickup = !fullRack && anyStanding;
+    game.sweep = { t: 0, fullRack, newRack: fullRack && !allOver, pickup, nextPlayer, allOver, duration: game.fast ? 0.08 : (pickup ? 3.0 : 2.6), pushed: false };
     game.state = 'sweep';
-    Sound.sweep();
+    if (!game.fast) { machine.barTarget = MACHINE.barGuard; Sound.pinsetterStart(game.sweep.duration); }
+  }
+  /** Objetivos de la barra y la mesa según el instante del ciclo. */
+  function sweepTargets(sw, t) {
+    if (sw.pickup) {
+      machine.tableTarget = t < 0.75 ? MACHINE.tableDown : t < 2.25 ? MACHINE.tableLift : t < 2.9 ? MACHINE.tableDown : MACHINE.tableRest;
+      machine.barTarget = t < 1.15 ? MACHINE.barGuard : t < 2.05 ? MACHINE.barEnd : t < 2.9 ? MACHINE.barGuard : MACHINE.barRest;
+      sw.liftOn = t >= 0.7 && t < 2.9;
+      sw.pushOn = t >= 1.15 && t < 2.05;
+      // La mesa engancha los bolos cuando llega abajo y los suelta al volver a dejarlos
+      if (sw.liftOn && machine.table.y <= MACHINE.tableDown + 1e-3) sw.engaged = true;
+      if (!sw.liftOn) sw.engaged = false;
+    } else {
+      machine.barTarget = t < 0.9 ? MACHINE.barEnd : t < 1.9 ? MACHINE.barGuard : MACHINE.barRest;
+      machine.tableTarget = (sw.newRack && t >= 0.8 && t < 1.9) ? MACHINE.tableDown : MACHINE.tableRest;
+      sw.hangOn = sw.newRack && t >= 0.8;
+      if (sw.hangOn && machine.table.y <= MACHINE.tableDown + 1e-3) sw.placed = true;
+      sw.pushOn = t < 0.95;
+    }
   }
 
   function endSweep() {
@@ -2840,6 +3550,8 @@ const BowlingRenderer3D = (function () {
     }
     showOverlay(el.overlayOver);
     el.live.textContent = 'Fin de la partida. ' + rows.map((r) => `${r.name}: ${r.score}`).join(', ');
+    laneStatus({ line1: 'FIN', line2: rows.map((r) => `${r.name} ${r.score}`).join(' · ') });
+    machine.barTarget = MACHINE.barRest; machine.tableTarget = MACHINE.tableRest;
     Sound.rollStop();
   }
   // ------------------------------------------------------------ efectos
@@ -2873,9 +3585,10 @@ const BowlingRenderer3D = (function () {
     const r = canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top, t: e.timeStamp || performance.now() };
   }
-  /** Toque o tecla durante la jugada: acelera la bola, salta el mensaje y la recogida. */
+  /** Toque o tecla durante la jugada: acelera la bola, salta la repetición, el mensaje y la recogida. */
   function skipAhead() {
-    if (game.state === 'rolling') { game.timeScale = 3; game.slowmo = 0; return true; }
+    if (game.state === 'rolling') { game.timeScale = 3; game.slowmo = 0; game.hurry = true; return true; }
+    if (game.state === 'replay') { showResult(); return true; }
     if (game.state === 'result') { game.timer = 0; return true; }
     if (game.state === 'sweep') { game.skip = true; return true; }
     return false;
@@ -3100,12 +3813,6 @@ const BowlingRenderer3D = (function () {
       cam.shake *= Math.pow(0.0005, dt);
       cam.sx = (Math.random() - 0.5) * cam.shake; cam.sy = (Math.random() - 0.5) * cam.shake;
     } else { cam.shake = 0; cam.sx = 0; cam.sy = 0; }
-    // caída del rack nuevo
-    if (game.rack.dropping) {
-      game.rack.t += dt * (game.fast ? 10 : 1);
-      game.rack.drop = 1 - easeOut(game.rack.t / 0.55);
-      if (game.rack.t >= 0.55) { game.rack.drop = 0; game.rack.dropping = false; }
-    }
 
     if (game.state === 'aim') {
       const kv = (game.keys.has('ArrowLeft') ? -1 : 0) + (game.keys.has('ArrowRight') ? 1 : 0);
@@ -3124,27 +3831,27 @@ const BowlingRenderer3D = (function () {
       const w = game.world;
       P.step(w, dt * scale * (game.fast ? 6 : 1), onWorldEvents);
       const b = w.ball;
-      Sound.rollUpdate(b.inPit || b.stopped ? 0 : Math.hypot(b.v[0], b.v[2]), b.inGutter, b.p[0] / LANE.halfWidth);
+      Sound.rollUpdate(b.inPit || b.stopped ? 0 : Math.hypot(b.v[0], b.v[2]), b.inGutter, b.p[0] / LANE.halfWidth, b.p[2]);
+      recordSnapshot();
       if (w.finished) finishRoll();
+    } else if (game.state === 'replay') {
+      replayUpdate(dt);
     } else if (game.state === 'result') {
       game.timer -= dt;
       if (game.timer <= 0) startSweep();
     } else if (game.state === 'sweep') {
       const sw = game.sweep;
       sw.t += dt * (game.skip ? 4 : 1);
-      const t = sw.t / sw.duration;
       const w = game.world;
-      // La barra recorre la zona de bolos de delante hacia atrás; los bolos desaparecen al pasar
-      // La barra baja, recorre la zona de bolos empujando la madera caída al foso y vuelve; los bolos en pie se elevan
-      const tb = clamp((t - 0.1) / 0.7, 0, 1);
-      sw.barZ = lerp(LANE.deckStartZ - 0.25, LANE.pitZ + 0.15, easeInOut(tb));
-      sw.lift = sw.fullRack ? 0 : 0.4 * Math.sin(Math.PI * clamp(t, 0, 1));
       if (!game.fast) {
-        if (t > 0.1 && t < 0.85) P.sweepPush(w, sw.barZ, sw.fullRack);
-        P.step(w, dt * 1.0, null, true);
+        sweepTargets(sw, sw.t);
+        if (sw.liftOn) for (const p of w.pins) if (P.isStanding(p)) p.held = true;
+        if (sw.pushOn && machine.bar.y < 0.02) P.sweepPush(w, machine.bar.z, sw.fullRack);
+        P.step(w, dt * (game.skip ? 2 : 1), null, true);
       }
-      if (t >= 1) endSweep();
+      if (sw.t >= sw.duration) endSweep();
     }
+    machineUpdate(dt * (game.state === 'sweep' && game.skip ? 3 : 1));
   }
 
   // ------------------------------------------------------------ render 3D (WebGL)
@@ -3154,28 +3861,39 @@ const BowlingRenderer3D = (function () {
   }
   createRenderer();
   canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); R3 = null; });
-  canvas.addEventListener('webglcontextrestored', () => { createRenderer(); resize(); camReset(); });
+  canvas.addEventListener('webglcontextrestored', () => { createRenderer(); applyQuality(); camReset(); });
   const CAMERA = {
     aimEye: [0, 1.35, -3.2], aimTarget: [0, 0.35, 9],
     back: 3.0, height: 1.1, pinCamZ: 15.0,
+    pinCamEye: [-0.66, 0.48, LANE.headPinZ - 1.45], pinCamTarget: [0.1, 0.24, LANE.headPinZ + 0.35],
   };
-  const camState = { eye: CAMERA.aimEye.slice(), target: CAMERA.aimTarget.slice() };
+  const camState = { eye: CAMERA.aimEye.slice(), target: CAMERA.aimTarget.slice(), hfov: 56 };
   function camReset() {
     camState.eye = CAMERA.aimEye.slice(); camState.target = CAMERA.aimTarget.slice();
     if (R3) { R3.cam.eye = camState.eye.slice(); R3.cam.target = camState.target.slice(); }
   }
+  /** Corte de cámara (sin transición), como el cambio a la cámara de repetición. */
+  function camCut() {
+    const g = camGoal();
+    camState.eye = g.eye.slice(); camState.target = g.target.slice();
+  }
   function camGoal() {
     const w = game.world;
     const b = w && w.ball;
+    if (game.state === 'replay' && game.replay) {
+      const k = clamp((game.replay.t - game.replay.t0) / Math.max(0.1, game.replay.t1 - game.replay.t0), 0, 1);
+      const e = CAMERA.pinCamEye;
+      return { eye: [e[0] + 0.06 * k, e[1] + 0.03 * k, e[2] + 0.3 * k], target: CAMERA.pinCamTarget.slice(), hfov: 46 };
+    }
     if (game.state === 'rolling' && b && b.active) {
       const bx = clamp(b.p[0] * 0.6, -0.8, 0.8);
       if (b.p[2] > CAMERA.pinCamZ || b.inPit) {
-        return { eye: [bx * 0.4, 1.5, CAMERA.pinCamZ - 0.7], target: [b.p[0] * 0.3, 0.35, LANE.headPinZ + 0.6] };
+        return { eye: [bx * 0.4, 1.3, CAMERA.pinCamZ - 0.7], target: [b.p[0] * 0.3, 0.35, LANE.headPinZ + 0.6] };
       }
       return { eye: [bx, CAMERA.height, b.p[2] - CAMERA.back], target: [b.p[0] * 0.8, 0.22, b.p[2] + 2.2] };
     }
     if (game.state === 'result' || game.state === 'sweep') {
-      return { eye: [0.55, 1.5, CAMERA.pinCamZ - 0.7], target: [0, 0.35, LANE.headPinZ + 0.6] };
+      return { eye: [0.55, 1.3, CAMERA.pinCamZ - 0.7], target: [0, 0.35, LANE.headPinZ + 0.6] };
     }
     const ax = game.drag && game.drag.mode === 'position' ? game.drag.startAimX : game.aimX;
     return { eye: [ax * 0.5, CAMERA.aimEye[1], CAMERA.aimEye[2]], target: [ax * 0.3 + Math.sin(game.aimAngle) * 6, CAMERA.aimTarget[1], CAMERA.aimTarget[2]] };
@@ -3189,13 +3907,15 @@ const BowlingRenderer3D = (function () {
       camState.eye[i] += (goal.eye[i] - camState.eye[i]) * k;
       camState.target[i] += (goal.target[i] - camState.target[i]) * k2;
     }
+    camState.hfov += ((goal.hfov || 56) - camState.hfov) * (1 - Math.exp(-6 * dt));
     if (R3) {
       R3.cam.eye = [camState.eye[0] + cam.sx * 0.002, camState.eye[1] + cam.sy * 0.002, camState.eye[2]];
       R3.cam.target = camState.target.slice();
       const aspect = W / Math.max(1, H);
       // Campo horizontal aproximadamente constante: en vertical se abre el vertical
-      const hfov = 56 * Math.PI / 180;
-      R3.cam.fov = clamp(2 * Math.atan(Math.tan(hfov / 2) / aspect), 38 * Math.PI / 180, 62 * Math.PI / 180);
+      const hfov = camState.hfov * Math.PI / 180;
+      const minFov = (game.state === 'replay' ? 26 : 38) * Math.PI / 180;
+      R3.cam.fov = clamp(2 * Math.atan(Math.tan(hfov / 2) / aspect), minFov, 62 * Math.PI / 180);
     }
   }
   /** Proyección cenital compartida por el modo 2D de emergencia. */
@@ -3229,16 +3949,27 @@ const BowlingRenderer3D = (function () {
     const w = game.world;
     if (!R3) { render2D(); return; }
     if (!w) return;
-    const dropZ = game.rack.dropping ? game.rack.drop * 0.5 : 0;
-    const lift = game.state === 'sweep' && game.sweep ? game.sweep.lift || 0 : 0;
-    const pins = w.pins.map((p) => {
-      const dy = (dropZ) + (lift && P.isStanding(p) ? lift : 0);
-      return { p: dy ? [p.p[0], p.p[1] + dy, p.p[2]] : p.p, q: p.q, state: p.state, alpha: 1 };
-    });
-    const b = w.ball;
-    let ball;
-    if (game.state === 'aim') ball = { p: [game.aimX, BALL.radius, 0], q: [0, 0, 0, 1], visible: true };
-    else ball = { p: b.p, q: b.q, visible: b.active && !(b.inPit && (b.pitT > 1.2 || b.p[1] < -0.25)) };
+    let pins, ball, bar = { y: machine.bar.y, z: machine.bar.z };
+    if (game.state === 'replay' && game.replay) {
+      const f = replayFrame();
+      pins = f.pins; ball = f.ball; bar = f.bar;
+    } else {
+      const sw = game.state === 'sweep' ? game.sweep : null;
+      const liftOff = Math.max(0, machine.table.y - MACHINE.tableDown);
+      const lifting = sw && sw.engaged ? liftOff : 0;         // bolos en pie elevados por la mesa
+      pins = w.pins.map((p) => {
+        const dy = p.held && P.isStanding(p) ? lifting : 0;
+        return { p: dy ? [p.p[0], p.p[1] + dy, p.p[2]] : p.p, q: p.q, state: p.state, alpha: 1 };
+      });
+      // Rack nuevo colgado de la mesa mientras baja; una vez colocado se queda en la plataforma
+      if (sw && sw.hangOn) {
+        const dy = sw.placed ? 0 : liftOff;
+        for (const q of P.rackPositions()) pins.push({ p: [q.x, PIN.comHeight + dy, q.z], q: [0, 0, 0, 1], state: 'standing', alpha: 1 });
+      }
+      const b = w.ball;
+      if (game.state === 'aim') ball = { p: [game.aimX, BALL.radius, 0], q: [0, 0, 0, 1], visible: true };
+      else ball = { p: b.p, q: b.q, visible: b.active && !(b.inPit && (b.pitT > 1.2 || b.p[1] < -0.25)) };
+    }
     let guide = null;
     if (game.state === 'aim' && !anyOverlayOpen()) {
       const pw = game.drag && game.drag.mode === 'swipe' ? game.drag.power : (game.power.active ? game.power.value : null);
@@ -3246,9 +3977,10 @@ const BowlingRenderer3D = (function () {
       if (key !== guideCache.key) guideCache = { key, pts: guidePoints() };
       guide = guideCache.pts;
     }
-    const sweep = game.state === 'sweep' && game.sweep && game.sweep.barZ != null ? { y: 0.0, z: game.sweep.barZ } : null;
-    const staticKey = game.state === 'aim' && !game.rack.dropping ? 'aim|' + game.aimX.toFixed(3) + '|' + w.pins.map((p) => p.id + p.state).join(',') : null;
-    R3.render({ pins, ball, guide, sweep, staticKey });
+    const machineStill = Math.abs(machine.bar.y - MACHINE.barRest.y) < 1e-3 && Math.abs(machine.table.y - MACHINE.tableRest) < 1e-3;
+    const staticKey = game.state === 'aim' && machineStill ? 'aim|' + game.aimX.toFixed(3) + '|' + w.pins.map((p) => p.id + p.state).join(',') : null;
+    const table = { y: game.state === 'replay' ? MACHINE.tableRest : machine.table.y };
+    R3.render({ pins, ball, guide, sweep: bar, table, staticKey });
     drawParticles();
   }
   // Lienzo 2D superpuesto para el confeti y para el modo sin WebGL
@@ -3282,9 +4014,10 @@ const BowlingRenderer3D = (function () {
   let last = performance.now();
   let paused = false;
   function frame(now) {
-    const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
+    const raw = Math.max(0, (now - last) / 1000);
+    const dt = Math.min(0.1, raw);          // en equipos lentos el juego sigue en tiempo real (la física da hasta 40 subpasos)
     last = now;
-    if (!paused) { update(dt); camUpdate(dt); render(); }
+    if (!paused) { update(dt); camUpdate(dt); render(); qualitySample(raw); }
     requestAnimationFrame(frame);
   }
   document.addEventListener('visibilitychange', () => {
@@ -3294,7 +4027,7 @@ const BowlingRenderer3D = (function () {
 
   // ------------------------------------------------------------ arranque
   game.world = P.createWorld(1);
-  resize();
+  applyQuality();
   camReset();
   applySound();
   setSpin(0);
@@ -3304,7 +4037,7 @@ const BowlingRenderer3D = (function () {
 
   // ------------------------------------------------------------ API de depuración / pruebas automáticas
   window.__bowling = {
-    S, P, game, cam,
+    S, P, game, cam, machine,
     start(names) { startGame(names && names.length ? names : ['Jugador 1']); },
     throwBall(o) { return doThrow(Object.assign({ x: 0.07, power: 0.8, angle: 0 }, o)); },
     /** Aplica un tiro sin física: derriba `n` bolos en pie (para probar el marcador). */
@@ -3320,12 +4053,14 @@ const BowlingRenderer3D = (function () {
       return true;
     },
     setFast(v) { game.fast = !!v; },
+    pauseLoop(v) { paused = !!v; if (!paused) last = performance.now(); },
+    setQuality(tier) { quality.auto = false; quality.tier = clamp(tier | 0, 0, 2); applyQuality(); },
     renderer() { return R3; },
     freezeCamera(eye, target) { game.freezeCam = !!eye; if (eye && R3) { R3.cam.eye = eye; R3.cam.target = target; } },
     setSeed(n) { game.seed = (n >>> 0) || 1; game.seedOverride = game.seed; },
     skip() { return skipAhead(); },
     lastThrow() { return game.lastThrow ? Object.assign({}, game.lastThrow) : null; },
-    step(seconds) { const n = Math.ceil(seconds / (1 / 60)); for (let i = 0; i < n; i++) update(1 / 60); render(); },
+    step(seconds) { const n = Math.ceil(seconds / (1 / 60)); for (let i = 0; i < n; i++) { update(1 / 60); camUpdate(1 / 60); } render(); },
     state() {
       return {
         state: game.state, current: game.current,
@@ -3333,6 +4068,7 @@ const BowlingRenderer3D = (function () {
         standing: game.world ? game.world.pins.filter((p) => P.isStanding(p)).map((p) => p.id) : [],
         lastRoll: game.lastRoll || null,
         aimX: game.aimX, spin: game.spin,
+        replays: game.stats.replays, quality: quality.tier,
       };
     },
   };
