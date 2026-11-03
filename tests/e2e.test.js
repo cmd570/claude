@@ -11,7 +11,7 @@ const path = require('node:path');
 let chromium = null;
 try { ({ chromium } = require('playwright')); } catch (e) { /* sin Playwright */ }
 
-const URL = 'file://' + path.join(__dirname, '..', 'index.html');
+const URL = 'file://' + (process.env.BOWLING_HTML || path.join(__dirname, '..', 'index.html'));
 
 async function open(browser, opts) {
   const ctx = await browser.newContext(Object.assign({ viewport: { width: 420, height: 800 }, deviceScaleFactor: 1 }, opts || {}));
@@ -173,6 +173,48 @@ test('el medidor de potencia por teclado lanza la bola', { skip: !chromium && 'P
     const st = await page.evaluate(() => window.__bowling.state());
     assert.equal(st.spin, 0.25);
     await page.waitForFunction(() => window.__bowling.state().players[0].rolls.length === 1, null, { timeout: 20000 });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('tocar la pista durante la jugada acelera y salta la recogida', { skip: !chromium && 'Playwright no disponible' }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const { page, errors } = await open(browser);
+    await page.evaluate(() => { window.__bowling.start(['Ana']); });
+    await page.waitForFunction(() => window.__bowling.state().state === 'aim');
+    await page.evaluate(() => window.__bowling.throwBall({ x: 0.07, power: 0.8, angle: 0 }));
+    await page.waitForFunction(() => window.__bowling.state().state === 'rolling');
+    const box = await page.$eval('#game', (c) => { const r = c.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; });
+    const t0 = Date.now();
+    await page.mouse.click(box.x, box.y);               // acelera la bola
+    assert.equal(await page.evaluate(() => window.__bowling.game.timeScale), 3);
+    await page.waitForFunction(() => window.__bowling.state().state === 'result', null, { timeout: 15000 });
+    await page.mouse.click(box.x, box.y);               // salta el mensaje
+    await page.waitForFunction(() => window.__bowling.state().state === 'sweep', null, { timeout: 5000 });
+    await page.keyboard.press('Space');                 // salta la recogida
+    await page.waitForFunction(() => window.__bowling.state().state === 'aim', null, { timeout: 5000 });
+    assert.ok(Date.now() - t0 < 9000, 'la jugada completa acelerada dura menos de 9 s');
+    const st = await page.evaluate(() => window.__bowling.state());
+    assert.equal(st.players[0].rolls.length, 1);
+    assert.equal(await page.evaluate(() => window.__bowling.game.timeScale), 1, 'la velocidad vuelve a la normalidad');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('R repite el último tiro con los mismos parámetros', { skip: !chromium && 'Playwright no disponible' }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const { page, errors } = await open(browser);
+    await page.evaluate(() => { window.__bowling.setFast(true); window.__bowling.start(['Ana']); });
+    await page.waitForFunction(() => window.__bowling.state().state === 'aim');
+    await page.evaluate(() => window.__bowling.throwBall({ x: 0.12, power: 0.6, angle: 0.01, spin: 0.5 }));
+    const first = await page.evaluate(() => window.__bowling.lastThrow());
+    await page.waitForFunction(() => window.__bowling.state().state === 'aim' && window.__bowling.state().players[0].rolls.length === 1, null, { timeout: 20000 });
+    await page.keyboard.press('r');
+    await page.waitForFunction(() => window.__bowling.state().state === 'rolling', null, { timeout: 5000 });
+    const second = await page.evaluate(() => window.__bowling.lastThrow());
+    assert.deepEqual(second, first);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

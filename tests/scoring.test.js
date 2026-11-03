@@ -15,7 +15,7 @@ function loadScoring() {
   if (override) {
     return require(path.resolve(override));
   }
-  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const html = fs.readFileSync(process.env.BOWLING_HTML || path.join(__dirname, '..', 'index.html'), 'utf8');
   const m = html.match(/<script id="scoring">([\s\S]*?)<\/script>/);
   if (!m) throw new Error('No se encontró <script id="scoring"> en index.html');
   // Se evalúa en este mismo contexto (no en vm) para que los Array/Object

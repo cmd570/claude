@@ -2,8 +2,8 @@
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-<meta name="description" content="Juego de bowling (boliche) de 10 pinos en HTML5: física, efecto, marcador oficial y hasta 4 jugadores. Funciona en PC y móvil.">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Juego de bowling de 10 bolos en HTML5: física, efecto, marcador oficial y hasta 4 jugadores. Funciona en PC y móvil.">
 <meta name="theme-color" content="#0b0f1a">
 <title>Bowling</title>
 <style>
@@ -35,6 +35,7 @@
   button { font: inherit; color: inherit; }
   .btn {
     appearance: none;
+    touch-action: manipulation;
     border: 1px solid var(--line);
     background: #1a2336;
     color: var(--text);
@@ -71,20 +72,21 @@
     overflow-x: auto; padding: .3rem .5rem;
     -webkit-overflow-scrolling: touch;
   }
-  .sb {
-    display: grid;
-    grid-template-columns: minmax(58px, 1.4fr) repeat(9, minmax(28px, 1fr)) minmax(42px, 1.5fr) minmax(40px, 1fr);
-    gap: 2px; min-width: 420px;
+  table.sb {
+    border-collapse: separate; border-spacing: 2px; width: 100%; min-width: 420px; table-layout: fixed;
+    font-size: .72rem;
   }
-  .sb > div { font-size: .72rem; }
-  .sb-head { color: var(--muted); text-align: center; padding: 1px 0; }
+  .sb th, .sb td { padding: 0; vertical-align: middle; }
+  .sb-head { color: var(--muted); text-align: center; font-weight: 400; padding: 1px 0; }
   .sb-head.name { text-align: left; padding-left: 4px; }
   .sb-name {
-    display: flex; align-items: center; padding: 0 4px; font-weight: 600;
+    text-align: left; padding: 0 4px; font-weight: 600;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 4px;
+    position: sticky; left: 0; background: var(--panel-2); z-index: 1;
   }
+  .sb-head.name { position: sticky; left: 0; background: var(--panel-2); z-index: 1; }
   .sb-row.current .sb-name { color: var(--accent); }
-  .sb-frame { background: #182236; border: 1px solid var(--line); border-radius: 4px; display: flex; flex-direction: column; }
+  .sb-frame { background: #182236; border: 1px solid var(--line); border-radius: 4px; }
   .sb-frame.current { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
   .sb-rolls { display: flex; border-bottom: 1px solid var(--line); }
   .sb-rolls span {
@@ -95,11 +97,13 @@
   .sb-rolls span.x { color: var(--accent); font-weight: 700; }
   .sb-rolls span.sp { color: var(--accent-2); font-weight: 700; }
   .sb-total { text-align: center; font-weight: 700; font-size: .8rem; line-height: 1.3rem; font-variant-numeric: tabular-nums; }
-  .sb-sum { display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: .9rem; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .sb-sum { text-align: center; font-weight: 800; font-size: .9rem; color: var(--accent); font-variant-numeric: tabular-nums; }
 
   /* ---------- Escenario ---------- */
   #stage { position: relative; flex: 1; min-height: 0; background: #05070d; }
-  #game { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+  #game { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  #game:focus-visible { outline: 2px solid rgba(56, 189, 248, .55); outline-offset: -2px; }
+  @media (pointer: coarse) { .btn { min-height: 44px; } .btn.icon { min-width: 44px; } }
 
   .hud { position: absolute; left: 0; right: 0; pointer-events: none; padding: .5rem .6rem; display: flex; align-items: flex-start; gap: .5rem; }
   .hud > * { pointer-events: auto; }
@@ -178,10 +182,21 @@
     header h1 { font-size: .95rem; }
     .btn { padding: .4rem .6rem; }
     #hint { display: none; }
-    .sb { min-width: 372px; grid-template-columns: minmax(48px, 1.2fr) repeat(9, minmax(25px, 1fr)) minmax(37px, 1.5fr) minmax(34px, 1fr); }
+    table.sb { min-width: 372px; }
     .sb-rolls span { font-size: .62rem; }
     .sb-total { font-size: .72rem; }
   }
+  /* Móvil apaisado: menos altura para el marcador y sin pista de ayuda sobre la bola */
+  @media (max-height: 520px) {
+    #scoreboard { padding: .15rem .5rem; }
+    table.sb { font-size: .62rem; }
+    .sb-rolls span { line-height: 1rem; height: 1rem; font-size: .6rem; }
+    .sb-total { line-height: 1rem; font-size: .66rem; }
+    .sb-head { padding: 0; }
+    #hint { display: none; }
+    .hud { padding: .3rem .5rem; }
+  }
+  [hidden] { display: none !important; }
   @media (prefers-reduced-motion: reduce) {
     #message.show { animation-duration: .01s; opacity: 1; transform: translate(-50%, -50%); }
     .btn { transition: none; }
@@ -201,11 +216,11 @@
   <div id="scoreboard" aria-label="Marcador"></div>
 
   <div id="stage">
-    <canvas id="game" aria-label="Pista de bowling. Arrastra hacia arriba para lanzar la bola." role="img"></canvas>
+    <canvas id="game" tabindex="0" aria-label="Pista de bowling. Arrastra hacia arriba para lanzar la bola." role="img"></canvas>
 
     <div class="hud" id="hud-top">
       <div class="chip" id="status"><b>Jugador 1</b> · Cuadro 1 · Tiro 1</div>
-      <div class="chip" id="pins-chip">Pinos en pie: <b>10</b></div>
+      <div class="chip" id="pins-chip">Bolos en pie: <b>10</b></div>
     </div>
 
     <div id="power" aria-hidden="true"><div id="power-fill"></div></div>
@@ -219,7 +234,7 @@
         </div>
         <button class="btn icon" id="spin-right" type="button" aria-label="Más efecto a la derecha" title="Efecto derecha (D)">↷</button>
       </div>
-      <div id="hint" class="chip">Arrastra hacia arriba para lanzar · <kbd>Espacio</kbd> potencia · <kbd>←</kbd><kbd>→</kbd> posición</div>
+      <div id="hint" class="chip">Arrastra hacia arriba para lanzar · <kbd>Espacio</kbd> potencia · <kbd>←</kbd><kbd>→</kbd> posición · toca para acelerar</div>
     </div>
 
     <div id="message" aria-hidden="true"></div>
@@ -229,7 +244,7 @@
     <div class="overlay open" id="overlay-setup" role="dialog" aria-modal="true" aria-labelledby="setup-title">
       <form class="dialog" id="setup-form">
         <h2 id="setup-title">🎳 <span>Bowling</span> · Nueva partida</h2>
-        <p>Diez cuadros, reglas oficiales. Derriba los 10 pinos de un tiro para un <b>strike</b>, o en dos para un <b>spare</b>.</p>
+        <p>Diez cuadros, reglas oficiales. Derriba los 10 bolos de un tiro para un <b>strike</b>, o en dos para un <b>spare</b>.</p>
         <div class="field">
           <label for="player-count">Jugadores</label>
           <select id="player-count">
@@ -241,6 +256,7 @@
         </div>
         <div id="players-list"></div>
         <div class="actions">
+          <button class="btn" type="button" id="btn-setup-cancel" hidden>Volver a la partida</button>
           <button class="btn" type="button" id="btn-setup-help">Cómo jugar</button>
           <button class="btn primary" type="submit" id="btn-start">¡A jugar!</button>
         </div>
@@ -257,8 +273,10 @@
           <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>Ajustar el ángulo del tiro.</dd>
           <dt><kbd>A</kbd> <kbd>D</kbd></dt><dd>Efecto (gancho) a izquierda o derecha. La bola curva más al final de la pista.</dd>
           <dt><kbd>Espacio</kbd></dt><dd>Arranca el medidor de potencia; pulsa de nuevo para lanzar.</dd>
+          <dt><kbd>R</kbd></dt><dd>Repetir el último tiro (misma posición, fuerza y efecto).</dd>
           <dt><kbd>M</kbd></dt><dd>Silenciar / activar sonido.</dd>
-          <dt>Consejo</dt><dd>Apunta al «bolsillo» entre el pino 1 y el 3 (o el 1 y el 2) con buena velocidad para conseguir strikes. A potencia máxima el tiro pierde algo de precisión.</dd>
+          <dt>Acelerar</dt><dd>Toca la pista o pulsa <kbd>Espacio</kbd> mientras rueda la bola para acelerar, y de nuevo para saltar la recogida.</dd>
+          <dt>Consejo</dt><dd>Apunta al «bolsillo» entre el bolo 1 y el 3 (o el 1 y el 2) con buena velocidad para conseguir strikes. A potencia máxima el tiro pierde algo de precisión.</dd>
         </dl>
         <p>Puntuación: strike = 10 + los dos tiros siguientes; spare = 10 + el tiro siguiente. En el cuadro 10 un strike o spare da un tiro extra. Máximo: 300.</p>
         <div class="actions"><button class="btn primary" type="button" id="btn-help-close">Entendido</button></div>
@@ -503,10 +521,12 @@ const BowlingPhysics = (function () {
     fallenFriction: 2.2,         // deceleración de un pino caído
     restBallPin: 0.3,
     restPinPin: 0.35,
-    restWall: 0.35,
+    restWall: 0.35,              // bola contra las paredes laterales
+    restWallPin: 0.62,           // pinos contra las paredes: rebotes vivos («mensajeros»)
     frictionBallPin: 0.15,       // coeficiente tangencial
     frictionPinPin: 0.35,
-    fallImpact: 0.65,             // m/s de impacto normal para derribar un pino
+    fallImpact: 0.65,            // m/s de impacto normal para derribar un pino
+    wobbleImpact: 0.25,          // por encima de esto (y por debajo de fallImpact) el pino tiembla pero sigue en pie
     fallDisplacement: 0.09,      // m de desplazamiento desde su sitio para caer
     hookAccel: 0.9,              // m/s² lateral con efecto máximo en la zona seca
     hookOilZone: 0.68,           // fracción de la pista con aceite (poco gancho)
@@ -518,7 +538,9 @@ const BowlingPhysics = (function () {
     pinWobble: 0.012,            // pequeño azar al caer (m/s)
     sweepExtra: 0.09,            // radio extra de un pino mientras cae (su cuerpo al volcar barre más área)
     sweepDur: 0.3,               // duración (s) de ese barrido
-    releaseJitter: 0.06 * Math.PI / 180, // pequeña variación humana del ángulo de salida (rad)
+    releaseJitter: 0.14 * Math.PI / 180, // variación humana del ángulo de salida (±4,5 cm en los bolos)
+    xJitter: 0.01,               // y de la posición de salida (m)
+    hookSpeedRef: 8,             // el gancho se normaliza a esta velocidad para que no dependa de la potencia
     riskSpeed: 9.0,              // a partir de esta velocidad el tiro pierde precisión...
     riskAngle: 0.2 * Math.PI / 180, // ...hasta ±0,2° de ángulo
     riskOffset: 0.025,           // ...y ±2,5 cm de posición a máxima potencia
@@ -559,6 +581,7 @@ const BowlingPhysics = (function () {
       state: 'standing',          // standing | fallen | pit
       fallDir: { x: 0, y: 1 },    // dirección en la que quedó tumbado
       fallT: 0,                   // tiempo desde que cayó (para animar)
+      wobbleT: null,              // tiempo desde el último temblor (sin caer)
       hits: 0,
     };
   }
@@ -591,18 +614,19 @@ const BowlingPhysics = (function () {
   function throwBall(world, opts) {
     const b = world.ball;
     const jitter = opts.exact ? 0 : 1;
-    const baseSpeed = clamp(opts.speed, SIM.minSpeed, SIM.maxSpeed);
+    const num = (v, d) => (Number.isFinite(v) ? v : d);
+    const baseSpeed = clamp(num(opts.speed, SIM.minSpeed), SIM.minSpeed, SIM.maxSpeed);
     // A máxima potencia el tiro es menos preciso (riesgo/recompensa)
     const over = clamp((baseSpeed - SIM.riskSpeed) / (SIM.maxSpeed - SIM.riskSpeed), 0, 1) * jitter;
     const speed = baseSpeed * (1 + jitter * (world.random() * 2 - 1) * SIM.speedJitter);
-    const angle = clamp(opts.angle || 0, -SIM.maxAngle, SIM.maxAngle)
+    const angle = clamp(num(opts.angle, 0), -SIM.maxAngle, SIM.maxAngle)
       + jitter * (world.random() * 2 - 1) * SIM.releaseJitter
       + over * (world.random() * 2 - 1) * SIM.riskAngle;
-    b.x = clamp((opts.x || 0) + over * (world.random() * 2 - 1) * SIM.riskOffset, -LANE.halfWidth + 0.02, LANE.halfWidth - 0.02);
+    b.x = clamp(num(opts.x, 0) + jitter * (world.random() * 2 - 1) * SIM.xJitter + over * (world.random() * 2 - 1) * SIM.riskOffset, -LANE.halfWidth + 0.02, LANE.halfWidth - 0.02);
     b.y = 0;
     b.vx = Math.sin(angle) * speed;
     b.vy = Math.cos(angle) * speed;
-    b.spin = clamp(opts.spin || 0, -1, 1);
+    b.spin = clamp(num(opts.spin, 0), -1, 1);
     b.active = true; b.inGutter = false; b.inPit = false; b.stopped = false;
     b.traveled = 0; b.time = 0; b.deckHit = false; b.hooked = 0;
     b.rollDir = { x: Math.sin(angle), y: Math.cos(angle) };
@@ -695,7 +719,9 @@ const BowlingPhysics = (function () {
       if (!b.inGutter && !inDeck && b.spin !== 0) {
         // La bola gancha hasta agotar su "reserva" de deslizamiento; después rueda recta.
         const reserve = SIM.hookReserve * Math.abs(b.spin);
-        const dv = SIM.hookAccel * b.spin * prof * dt;
+        const sp0 = Math.hypot(b.vx, b.vy);
+        const k = Math.min(1, (sp0 / SIM.hookSpeedRef) * (sp0 / SIM.hookSpeedRef));
+        const dv = SIM.hookAccel * b.spin * prof * k * dt;
         if (b.hooked + Math.abs(dv) <= reserve) { b.vx += dv; b.hooked += Math.abs(dv); }
       }
       const sp = Math.hypot(b.vx, b.vy);
@@ -725,6 +751,7 @@ const BowlingPhysics = (function () {
     const pins = world.pins;
     for (const p of pins) {
       if (p.state === 'pit') continue;
+      if (p.wobbleT != null) p.wobbleT += dt;
       if (p.state === 'fallen') {
         p.fallT += dt;
         // Al volcar, el cuerpo del pino barre más área que su base: radio de colisión temporalmente mayor
@@ -733,9 +760,9 @@ const BowlingPhysics = (function () {
       }
       applyFriction(p, p.state === 'fallen' ? SIM.fallenFriction : SIM.pinFriction, dt);
       p.x += p.vx * dt; p.y += p.vy * dt;
-      // Paredes laterales (kickbacks)
-      if (p.x < -LANE.kickbackX + p.r) { p.x = -LANE.kickbackX + p.r; if (p.vx < 0) { if (Math.abs(p.vx) > SIM.fallImpact) knockPin(world, p, 1, 0); p.vx = -p.vx * SIM.restWall; } }
-      if (p.x > LANE.kickbackX - p.r) { p.x = LANE.kickbackX - p.r; if (p.vx > 0) { if (Math.abs(p.vx) > SIM.fallImpact) knockPin(world, p, -1, 0); p.vx = -p.vx * SIM.restWall; } }
+      // Paredes laterales (kickbacks): rebotes vivos que pueden devolver un pino al centro
+      if (p.x < -LANE.kickbackX + p.r) { p.x = -LANE.kickbackX + p.r; if (p.vx < 0) { if (Math.abs(p.vx) > SIM.fallImpact) knockPin(world, p, 1, 0); p.vx = -p.vx * SIM.restWallPin; } }
+      if (p.x > LANE.kickbackX - p.r) { p.x = LANE.kickbackX - p.r; if (p.vx > 0) { if (Math.abs(p.vx) > SIM.fallImpact) knockPin(world, p, -1, 0); p.vx = -p.vx * SIM.restWallPin; } }
       // Foso: el pino desaparece
       if (p.y - p.r > LANE.pitY) {
         if (p.state === 'standing') knockPin(world, p, p.vx, p.vy);
@@ -764,6 +791,7 @@ const BowlingPhysics = (function () {
               world.events.push({ type: 'hit', impact, id: p.id, x: p.x, y: p.y, ball: true });
             }
             if (p.state === 'standing' && impact > SIM.fallImpact) knockPin(world, p, nx, ny);
+            else if (p.state === 'standing' && impact > SIM.wobbleImpact) p.wobbleT = 0;
           });
         }
       }
@@ -778,6 +806,9 @@ const BowlingPhysics = (function () {
             if (impact > SIM.fallImpact) {
               if (A.state === 'standing') knockPin(world, A, -nx, -ny);
               if (B.state === 'standing') knockPin(world, B, nx, ny);
+            } else if (impact > SIM.wobbleImpact) {
+              if (A.state === 'standing') A.wobbleT = 0;
+              if (B.state === 'standing') B.wobbleT = 0;
             }
           });
         }
@@ -814,11 +845,10 @@ const BowlingPhysics = (function () {
         if (p.state !== 'pit' && Math.hypot(p.vx, p.vy) > 0.02) { moving = true; break; }
       }
       world.settleTime = moving ? 0 : world.settleTime + dt;
-      if (world.settleTime >= 0.35 || world.time > 14) {
-        world.finished = true;
-        for (const p of pins) { p.vx = 0; p.vy = 0; }
-      }
+      if (world.settleTime >= 0.35) world.finished = true;
     }
+    if (b.active && world.time > 14) world.finished = true;   // tope absoluto
+    if (world.finished) for (const p of pins) { p.vx = 0; p.vy = 0; }
     return world;
   }
 
@@ -865,7 +895,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = BowlingPhy
    ========================================================================== */
 const Sound = (function () {
   'use strict';
-  let ctx = null, master = null, noiseBuf = null;
+  let ctx = null, master = null, noiseBuf = null, panner = null;
   let enabled = true;
   let roll = null;           // nodos del rodar de la bola
   let lastHit = 0;
@@ -881,6 +911,8 @@ const Sound = (function () {
     comp.threshold.value = -18; comp.knee.value = 20; comp.ratio.value = 8; comp.attack.value = 0.003; comp.release.value = 0.2;
     master = ctx.createGain();
     master.gain.value = enabled ? 0.9 : 0;
+    // Paneo estéreo según la posición lateral de la bola (si el navegador lo soporta)
+    if (ctx.createStereoPanner) { panner = ctx.createStereoPanner(); panner.connect(master); }
     master.connect(comp); comp.connect(ctx.destination);
     // Ruido blanco de 2 s reutilizable
     const len = ctx.sampleRate * 2;
@@ -893,8 +925,13 @@ const Sound = (function () {
   /** Debe llamarse desde un gesto del usuario (click/tecla) para desbloquear el audio. */
   function unlock() {
     if (!init()) return;
-    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    if (ctx.state !== 'running') { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
   }
+  /** iOS deja el contexto en «interrupted» tras una llamada o bloqueo: intentar reanudar. */
+  function resumeIfNeeded() {
+    if (ctx && ctx.state !== 'running' && ctx.state !== 'closed') { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+  }
+  const out = () => panner || master;
 
   function setEnabled(v) {
     enabled = !!v;
@@ -929,7 +966,7 @@ const Sound = (function () {
     const n = noiseSource();
     const bp = ctx.createBiquadFilter();
     bp.type = 'bandpass'; bp.frequency.value = byBall ? 1600 + 1400 * k : 2600 + 1800 * Math.random(); bp.Q.value = 1.2;
-    n.connect(bp); bp.connect(g); g.connect(master);
+    n.connect(bp); bp.connect(g); g.connect(out());
     env(g, now, 0.25 + 0.55 * k, 0.003, 0.07 + 0.06 * k);
     n.start(now); n.stop(now + 0.25);
     // golpe seco
@@ -938,7 +975,7 @@ const Sound = (function () {
     o.type = 'triangle';
     o.frequency.setValueAtTime(byBall ? 420 : 760 + Math.random() * 180, now);
     o.frequency.exponentialRampToValueAtTime(byBall ? 120 : 300, now + 0.08);
-    o.connect(og); og.connect(master);
+    o.connect(og); og.connect(out());
     env(og, now, 0.15 + 0.3 * k, 0.002, 0.09);
     o.start(now); o.stop(now + 0.15);
   }
@@ -953,13 +990,14 @@ const Sound = (function () {
     lp2.type = 'lowpass'; lp2.frequency.value = 400;
     const g = ctx.createGain();
     g.gain.value = 0.0001;
-    n.connect(lp); lp.connect(lp2); lp2.connect(g); g.connect(master);
+    n.connect(lp); lp.connect(lp2); lp2.connect(g); g.connect(out());
     n.start();
     roll = { n, g, lp };
   }
-  function rollUpdate(speed, inGutter) {
+  function rollUpdate(speed, inGutter, lateral) {
     if (!roll) return;
     const t = ctx.currentTime;
+    if (panner && typeof lateral === 'number') panner.pan.setTargetAtTime(Math.max(-0.7, Math.min(0.7, lateral * 0.6)), t, 0.08);
     const k = Math.min(1, speed / 9);
     roll.g.gain.setTargetAtTime(k * (inGutter ? 0.5 : 0.35), t, 0.05);
     roll.lp.frequency.setTargetAtTime(120 + 260 * k + (inGutter ? 120 : 0), t, 0.05);
@@ -1042,7 +1080,7 @@ const Sound = (function () {
     n.start(t); n.stop(t + 0.65);
   }
 
-  return { unlock, setEnabled, isEnabled, pinHit, rollStart, rollUpdate, rollStop, strike, spare, gutter, thud, click, sweep };
+  return { unlock, resumeIfNeeded, setEnabled, isEnabled, pinHit, rollStart, rollUpdate, rollStop, strike, spare, gutter, thud, click, sweep };
 })();
 </script>
 <script id="main">
@@ -1079,7 +1117,7 @@ const Sound = (function () {
     setupForm: $('setup-form'), playerCount: $('player-count'), playersList: $('players-list'),
     finalTable: $('final-table'), bestLine: $('best-line'),
     btnNew: $('btn-new'), btnHelp: $('btn-help'), btnSound: $('btn-sound'), btnSetupHelp: $('btn-setup-help'),
-    btnHelpClose: $('btn-help-close'), btnChange: $('btn-change'), btnAgain: $('btn-again'),
+    btnHelpClose: $('btn-help-close'), btnChange: $('btn-change'), btnAgain: $('btn-again'), btnSetupCancel: $('btn-setup-cancel'),
   };
 
   // ------------------------------------------------------------ lienzo
@@ -1161,18 +1199,18 @@ const Sound = (function () {
     el.live.textContent = sub ? `${text}. ${sub}` : text;
     msgTimer = 1.6;
   }
-  function setStatus() {
+  function setStatus(justThrown) {
     const p = game.players[game.current];
     if (!p) return;
     const st = S.analyze(p.rolls);
-    if (st.gameOver) return;
-    const n = st.next;
+    const n = justThrown && game.rollInfo ? game.rollInfo : st.next;
+    if (!n) return;
     el.status.innerHTML = '';
     const b = document.createElement('b'); b.textContent = p.name;
     el.status.appendChild(b);
     el.status.appendChild(document.createTextNode(` · Cuadro ${n.frame + 1} · Tiro ${n.roll + 1}`));
     const standing = game.world ? game.world.pins.filter((q) => q.state === 'standing').length : n.pinsStanding;
-    el.pinsChip.innerHTML = 'Pinos en pie: ';
+    el.pinsChip.innerHTML = 'Bolos en pie: ';
     const c = document.createElement('b'); c.textContent = String(standing);
     el.pinsChip.appendChild(c);
   }
@@ -1199,30 +1237,44 @@ const Sound = (function () {
 
   // ------------------------------------------------------------ marcador (DOM)
   function buildScoreboard() {
-    const sb = document.createElement('div');
+    const sb = document.createElement('table');
     sb.className = 'sb';
-    const head = (txt, cls) => { const d = document.createElement('div'); d.className = 'sb-head' + (cls ? ' ' + cls : ''); d.textContent = txt; return d; };
-    sb.appendChild(head('Jugador', 'name'));
-    for (let f = 1; f <= 10; f++) sb.appendChild(head(String(f)));
-    sb.appendChild(head('Total'));
+    const caption = document.createElement('caption'); caption.className = 'sr-only'; caption.textContent = 'Marcador por cuadros';
+    sb.appendChild(caption);
+    const cols = document.createElement('colgroup');
+    const widths = ['13%'].concat(Array(9).fill('7.3%'), ['11%', '10.3%']);
+    widths.forEach((w) => { const c = document.createElement('col'); c.style.width = w; cols.appendChild(c); });
+    sb.appendChild(cols);
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    const head = (txt, cls) => { const th = document.createElement('th'); th.scope = 'col'; th.className = 'sb-head' + (cls ? ' ' + cls : ''); th.textContent = txt; return th; };
+    hr.appendChild(head('Jugador', 'name'));
+    for (let f = 1; f <= 10; f++) hr.appendChild(head(String(f)));
+    hr.appendChild(head('Total'));
+    thead.appendChild(hr); sb.appendChild(thead);
+    const tbody = document.createElement('tbody');
     game.players.forEach((p, pi) => {
-      const name = document.createElement('div');
-      name.className = 'sb-name'; name.textContent = p.name; name.title = p.name;
+      const tr = document.createElement('tr');
+      tr.className = 'sb-row'; tr.dataset.player = String(pi);
+      const name = document.createElement('th');
+      name.scope = 'row'; name.className = 'sb-name'; name.textContent = p.name; name.title = p.name;
       name.dataset.player = String(pi);
-      sb.appendChild(name);
+      tr.appendChild(name);
       for (let f = 0; f < 10; f++) {
-        const fr = document.createElement('div');
+        const fr = document.createElement('td');
         fr.className = 'sb-frame'; fr.dataset.player = String(pi); fr.dataset.frame = String(f);
         const rolls = document.createElement('div'); rolls.className = 'sb-rolls';
         for (let k = 0; k < (f === 9 ? 3 : 2); k++) rolls.appendChild(document.createElement('span'));
         const total = document.createElement('div'); total.className = 'sb-total';
         fr.appendChild(rolls); fr.appendChild(total);
-        sb.appendChild(fr);
+        tr.appendChild(fr);
       }
-      const sum = document.createElement('div');
+      const sum = document.createElement('td');
       sum.className = 'sb-sum'; sum.dataset.player = String(pi); sum.textContent = '0';
-      sb.appendChild(sum);
+      tr.appendChild(sum);
+      tbody.appendChild(tr);
     });
+    sb.appendChild(tbody);
     el.scoreboard.innerHTML = '';
     el.scoreboard.appendChild(sb);
     updateScoreboard();
@@ -1241,7 +1293,8 @@ const Sound = (function () {
           spans[k].className = l === 'X' ? 'x' : l === '/' ? 'sp' : '';
         });
         cell.querySelector('.sb-total').textContent = fr.cumulative == null ? '' : String(fr.cumulative);
-        cell.classList.toggle('current', pi === game.current && f === nextFrame && game.state !== 'over');
+        const hiFrame = (game.state === 'result' || game.state === 'sweep') && pi === game.current && game.rollInfo ? game.rollInfo.frame : nextFrame;
+        cell.classList.toggle('current', pi === game.current && f === hiFrame && game.state !== 'over');
       });
       const sum = el.scoreboard.querySelector(`.sb-sum[data-player="${pi}"]`);
       if (sum) sum.textContent = String(st.total);
@@ -1260,10 +1313,17 @@ const Sound = (function () {
     game.players = names.map((n) => ({ name: n, rolls: [] }));
     game.current = 0;
     game.stats = { strikes: 0, spares: 0, gutters: 0 };
-    game.seed = (Date.now() % 100000) | 1;
+    game.seed = game.seedOverride || ((Date.now() % 100000) | 1);
+    game.seedOverride = null;
+    game.slowmo = 0; cam.shake = 0; cam.sx = 0; cam.sy = 0; particles.length = 0;
+    game.timer = 0; game.sweep = null; game.lastRoll = null; game.lastThrow = null; game.resumeState = null;
+    Sound.rollStop();
     buildScoreboard();
     el.overlaySetup.classList.remove('open');
     el.overlayOver.classList.remove('open');
+    el.scoreboard.scrollLeft = 0;
+    syncInert();
+    try { canvas.focus({ preventScroll: true }); } catch (e) { /* opcional */ }
     beginAim(true);
   }
 
@@ -1276,7 +1336,9 @@ const Sound = (function () {
       game.rack = { drop: 1, t: 0, dropping: true };
       for (const pin of game.world.pins) pin.alpha = 1;
     } else {
-      const standing = game.world.pins.filter((q) => q.state === 'standing').map((q) => ({ id: q.id, x: q.x, y: q.y }));
+      // El pinsetter vuelve a colocar en su marca los bolos que quedaron en pie
+      const rack = Object.fromEntries(P.rackPositions().map((q) => [q.id, q]));
+      const standing = game.world.pins.filter((q) => q.state === 'standing').map((q) => ({ id: q.id, x: rack[q.id].x, y: rack[q.id].y }));
       game.world = P.createWorld(game.seed++, standing);
       game.rack = { drop: 0, t: 0, dropping: false };
       for (const pin of game.world.pins) pin.alpha = 1;
@@ -1284,8 +1346,12 @@ const Sound = (function () {
     game.state = 'aim';
     game.rollInfo = { frame: st.next.frame, roll: st.next.roll, pinsBefore: st.next.pinsStanding, hitAny: false, slowDone: false };
     game.power = { active: false, value: 0, t: 0 };
+    el.power.classList.remove('visible');
+    el.powerFill.style.width = '0%';
     game.drag = null;
     game.aimAngle = 0;
+    game.timeScale = 1;
+    game.skip = false;
     cam.y = -CAM.back;
     setStatus();
     updateScoreboard();
@@ -1296,7 +1362,9 @@ const Sound = (function () {
   function doThrow(opts) {
     if (game.state !== 'aim') return false;
     const speed = lerp(SIM.minSpeed, SIM.maxSpeed, clamp(opts.power, 0, 1));
-    P.throwBall(game.world, { x: opts.x, speed: opts.speed != null ? opts.speed : speed, angle: opts.angle || 0, spin: opts.spin != null ? opts.spin : game.spin });
+    const params = { x: opts.x, speed: opts.speed != null ? opts.speed : speed, angle: opts.angle || 0, spin: opts.spin != null ? opts.spin : game.spin };
+    P.throwBall(game.world, params);
+    game.lastThrow = Object.assign({}, params);
     game.state = 'rolling';
     game.power.active = false;
     el.power.classList.remove('visible');
@@ -1348,6 +1416,10 @@ const Sound = (function () {
     let text, sub = '', minor = false;
     if (isStrike) {
       text = '¡STRIKE!';
+      const run = strikeRun(p.rolls);
+      if (run === 2) sub = '¡Doble!';
+      else if (run === 3) sub = '¡Pavo!';
+      else if (run >= 4) sub = `¡${run} seguidos!`;
       game.stats.strikes++;
       Sound.strike();
       spawnConfetti();
@@ -1359,20 +1431,39 @@ const Sound = (function () {
       text = '¡Canal!'; minor = true;
       game.stats.gutters++;
     } else if (knocked === 0) {
-      text = 'Sin pinos'; minor = true;
+      text = 'Ningún bolo'; minor = true;
+      if (info.roll === 1 && info.frame < 9) sub = 'Cuadro abierto';
     } else {
-      text = `${knocked} ${knocked === 1 ? 'pino' : 'pinos'}`; minor = true;
+      text = `${knocked} ${knocked === 1 ? 'bolo' : 'bolos'}`; minor = true;
       if (info.roll === 0 && isSplit(summary.standingIds)) sub = `Split ${summary.standingIds.join('-')}`;
+      else if (info.roll === 1 && info.frame < 9) sub = 'Cuadro abierto';
     }
     showMessage(text, sub, minor);
     game.state = 'result';
     game.timer = game.fast ? 0.05 : (isStrike ? 1.7 : 1.3);
     game.lastRoll = { knocked, isStrike, isSpare, gutter: !!info.gutter, standing: summary.standingIds, gameOver: st.gameOver };
     updateScoreboard();
-    setStatus();
+    setStatus(true);
   }
 
-  /** Split: el pino 1 cayó y los pinos en pie no están todos conectados entre sí. */
+  /** Strikes consecutivos que terminan en el último tiro (para «doble», «pavo»...). */
+  function strikeRun(rolls) {
+    const st = S.analyze(rolls);
+    let run = 0;
+    const seq = [];
+    for (const fr of st.frames) {
+      for (let k = 0; k < fr.rolls.length; k++) {
+        const r = fr.rolls;
+        // En el cuadro 10 un 10 solo es strike si se lanzó sobre el rack completo
+        const fullRack = fr.index < 9 || k === 0 || (k === 1 && r[0] === 10) || (k === 2 && (r[1] === 10 || (r[0] !== 10 && r[0] + r[1] === 10)));
+        seq.push({ strike: r[k] === 10 && fullRack });
+      }
+    }
+    for (let i = seq.length - 1; i >= 0 && seq[i].strike; i--) run++;
+    return run;
+  }
+
+  /** Split: el bolo 1 cayó y los bolos en pie no están todos conectados entre sí. */
   function isSplit(ids) {
     if (ids.length < 2 || ids.includes(1)) return false;
     const pos = Object.fromEntries(P.rackPositions().map((p) => [p.id, p]));
@@ -1435,7 +1526,7 @@ const Sound = (function () {
       line = `Récord en este dispositivo: <b>${prev.score}</b> (${prev.name})`;
     }
     el.bestLine.innerHTML = line;
-    el.overlayOver.classList.add('open');
+    showOverlay(el.overlayOver);
     el.live.textContent = 'Fin de la partida. ' + rows.map((r) => `${r.name}: ${r.score}`).join(', ');
     Sound.rollStop();
   }
@@ -1470,15 +1561,27 @@ const Sound = (function () {
     const r = canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top, t: performance.now() };
   }
+  /** Toque o tecla durante la jugada: acelera la bola, salta el mensaje y la recogida. */
+  function skipAhead() {
+    if (game.state === 'rolling') { game.timeScale = 3; game.slowmo = 0; return true; }
+    if (game.state === 'result') { game.timer = 0; return true; }
+    if (game.state === 'sweep') { game.skip = true; return true; }
+    return false;
+  }
   canvas.addEventListener('pointerdown', (e) => {
     Sound.unlock();
-    if (game.state !== 'aim' || game.power.active) return;
     if (e.button != null && e.button !== 0) return;
+    if (game.state !== 'aim') { if (!anyOverlayOpen()) { e.preventDefault(); skipAhead(); } return; }
+    if (game.power.active) return;
     e.preventDefault();
     try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* opcional */ }
     const p = pointerPos(e);
-    game.aimX = clamp(groundX(p.x, 0), -LANE.halfWidth + BALL.radius * 0.6, LANE.halfWidth - BALL.radius * 0.6);
-    game.drag = { id: e.pointerId, down: p, mode: 'position', start: null, samples: [p], angle: 0, power: 0 };
+    try { canvas.focus({ preventScroll: true }); } catch (err) { /* opcional */ }
+    // Tocar cerca de la bola la coloca donde está el dedo; desde lejos, arrastrar la desplaza de forma relativa
+    const ballScreen = project(game.aimX, 0, BALL.radius);
+    const near = Math.abs(p.x - ballScreen.x) < Math.max(70, ballScreen.s * BALL.radius * 3) && Math.abs(p.y - ballScreen.y) < Math.max(90, ballScreen.s * BALL.radius * 4);
+    if (near) game.aimX = clamp(groundX(p.x, 0), -LANE.halfWidth + BALL.radius * 0.6, LANE.halfWidth - BALL.radius * 0.6);
+    game.drag = { id: e.pointerId, down: p, mode: 'position', start: null, samples: [p], angle: 0, power: 0, relative: !near, startAimX: game.aimX, scale: project(0, 0, 0).s };
   });
   canvas.addEventListener('pointermove', (e) => {
     const d = game.drag;
@@ -1488,8 +1591,14 @@ const Sound = (function () {
     d.samples.push(p);
     if (d.samples.length > 16) d.samples.shift();
     if (d.mode === 'position') {
-      game.aimX = clamp(groundX(p.x, 0), -LANE.halfWidth + BALL.radius * 0.6, LANE.halfWidth - BALL.radius * 0.6);
-      if (d.down.y - p.y > 14) { d.mode = 'swipe'; d.start = p; }
+      const dx = p.x - d.down.x, dy = d.down.y - p.y;
+      // Un gesto claramente vertical desde el principio es un lanzamiento: la bola no se mueve
+      if (dy > 10 && dy > Math.abs(dx) * 1.2) { d.mode = 'swipe'; d.start = d.down; }
+      else if (Math.abs(dx) > 4 || dy <= 10) {
+        const target = d.relative ? d.startAimX + dx / d.scale : groundX(p.x, 0);
+        game.aimX = clamp(target, -LANE.halfWidth + BALL.radius * 0.6, LANE.halfWidth - BALL.radius * 0.6);
+        if (dy > 14) { d.mode = 'swipe'; d.start = p; }
+      }
     } else {
       const g = swipeGesture(d, p);
       d.angle = g.angle; d.power = g.power;
@@ -1507,8 +1616,9 @@ const Sound = (function () {
     if (g.length < 28) { game.aimAngle = 0; return; }
     doThrow({ x: game.aimX, power: g.power, angle: g.angle });
   }
-  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointerup', (e) => { Sound.unlock(); endPointer(e); });
   canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('lostpointercapture', (e) => { if (game.drag && game.drag.id === e.pointerId) endPointer(Object.assign({}, e, { type: 'pointercancel' })); });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
   /** Convierte el gesto (desde que empezó el deslizamiento) en potencia y ángulo. */
@@ -1525,7 +1635,7 @@ const Sound = (function () {
     }
     const lenNorm = clamp(length / (H * 0.5), 0, 1);
     const velNorm = clamp(v / (H * 3.2), 0, 1);
-    const power = clamp(0.45 * lenNorm + 0.65 * velNorm, 0.05, 1);
+    const power = clamp(0.25 * lenNorm + 0.85 * velNorm, 0.05, 1);
     // Ángulo: zona muerta de 2° y sensibilidad reducida; se ve en la guía mientras arrastras
     let a = dy > 0 ? Math.atan2(dx, dy) : 0;
     const dead = 2 * Math.PI / 180;
@@ -1541,14 +1651,22 @@ const Sound = (function () {
     if (k === 'm' || k === 'M') { toggleSound(); e.preventDefault(); return; }
     if (k === 'Escape') {
       if (el.overlayHelp.classList.contains('open')) { closeHelp(); e.preventDefault(); return; }
+      if (el.overlaySetup.classList.contains('open') && game.resumeState) { el.btnSetupCancel.click(); e.preventDefault(); return; }
       if (game.power.active) { game.power.active = false; el.power.classList.remove('visible'); e.preventDefault(); }
       return;
     }
     if (k === '?' ) { openHelp(); return; }
-    if (game.state !== 'aim' || anyOverlayOpen()) return;
+    if (anyOverlayOpen()) return;
+    if (game.state !== 'aim') {
+      if ((k === ' ' || k === 'Enter') && !e.repeat) { e.preventDefault(); skipAhead(); }
+      return;
+    }
     game.keys.add(k);
     Sound.unlock();
     switch (k) {
+      case 'r': case 'R':
+        if (game.lastThrow && !game.power.active) { game.aimX = game.lastThrow.x; doThrow({ x: game.lastThrow.x, speed: game.lastThrow.speed, angle: game.lastThrow.angle, spin: game.lastThrow.spin }); }
+        break;
       case 'ArrowLeft': case 'ArrowRight': e.preventDefault(); break;
       case 'ArrowUp': game.aimAngle = clamp(game.aimAngle + 0.25 * Math.PI / 180, -SIM.maxAngle, SIM.maxAngle); e.preventDefault(); break;
       case 'ArrowDown': game.aimAngle = clamp(game.aimAngle - 0.25 * Math.PI / 180, -SIM.maxAngle, SIM.maxAngle); e.preventDefault(); break;
@@ -1564,21 +1682,61 @@ const Sound = (function () {
     }
   });
   window.addEventListener('keyup', (e) => game.keys.delete(e.key));
-  window.addEventListener('blur', () => game.keys.clear());
+  window.addEventListener('blur', () => { game.keys.clear(); if (game.drag) { game.drag = null; game.aimAngle = 0; } });
 
   // ------------------------------------------------------------ interfaz
   function anyOverlayOpen() { return [el.overlaySetup, el.overlayHelp, el.overlayOver].some((o) => o.classList.contains('open')); }
-  let helpReturn = null;
-  function openHelp() { helpReturn = anyOverlayOpen() ? [el.overlaySetup, el.overlayOver].find((o) => o.classList.contains('open')) : null; if (helpReturn) helpReturn.classList.remove('open'); el.overlayHelp.classList.add('open'); el.btnHelpClose.focus(); }
-  function closeHelp() { el.overlayHelp.classList.remove('open'); if (helpReturn) { helpReturn.classList.add('open'); helpReturn = null; } }
-  el.btnHelp.addEventListener('click', openHelp);
-  el.btnSetupHelp.addEventListener('click', openHelp);
+  /** Mientras hay una ventana abierta, el resto de la interfaz queda inerte (sin foco ni clics). */
+  const inertTargets = [document.querySelector('header'), el.scoreboard, canvas, $('hud-top'), $('hud-bottom')];
+  function syncInert() {
+    const open = anyOverlayOpen();
+    for (const t of inertTargets) if (t) { if (open) t.setAttribute('inert', ''); else t.removeAttribute('inert'); }
+  }
+  function focusIn(overlay) {
+    const target = overlay.querySelector('input, select, .btn.primary, button');
+    if (target) { try { target.focus({ preventScroll: true }); } catch (e) { target.focus(); } }
+    const dlg = overlay.querySelector('.dialog'); if (dlg) dlg.scrollTop = 0;
+  }
+  function showOverlay(overlay) { overlay.classList.add('open'); syncInert(); focusIn(overlay); }
+  function hideOverlay(overlay) { overlay.classList.remove('open'); syncInert(); }
+  let helpReturn = null, helpOpener = null;
+  function openHelp(opener) {
+    if (el.overlayHelp.classList.contains('open')) return;
+    helpOpener = opener || document.activeElement;
+    helpReturn = [el.overlaySetup, el.overlayOver].find((o) => o.classList.contains('open')) || null;
+    if (helpReturn) helpReturn.classList.remove('open');
+    showOverlay(el.overlayHelp);
+  }
+  function closeHelp() {
+    hideOverlay(el.overlayHelp);
+    if (helpReturn) { showOverlay(helpReturn); helpReturn = null; }
+    else if (helpOpener && helpOpener.focus) { try { helpOpener.focus({ preventScroll: true }); } catch (e) { /* opcional */ } }
+    helpOpener = null;
+  }
+  el.btnHelp.addEventListener('click', () => openHelp(el.btnHelp));
+  el.btnSetupHelp.addEventListener('click', () => openHelp(el.btnSetupHelp));
   el.btnHelpClose.addEventListener('click', closeHelp);
   el.btnSound.addEventListener('click', toggleSound);
   el.spinLeft.addEventListener('click', () => { Sound.unlock(); Sound.click(); setSpin(game.spin - 0.25); });
   el.spinRight.addEventListener('click', () => { Sound.unlock(); Sound.click(); setSpin(game.spin + 0.25); });
-  el.btnNew.addEventListener('click', () => { Sound.rollStop(); game.state = 'setup'; el.overlayOver.classList.remove('open'); el.overlaySetup.classList.add('open'); });
-  el.btnChange.addEventListener('click', () => { el.overlayOver.classList.remove('open'); game.state = 'setup'; el.overlaySetup.classList.add('open'); });
+  /** Abre la configuración; si hay una partida en curso se puede volver a ella. */
+  function openSetup() {
+    const inProgress = game.players.length > 0 && game.state !== 'over' && game.state !== 'setup';
+    if (inProgress) { game.resumeState = game.state; Sound.rollStop(); }
+    game.state = 'setup';
+    el.btnSetupCancel.hidden = !inProgress;
+    hideOverlay(el.overlayOver);
+    showOverlay(el.overlaySetup);
+  }
+  el.btnNew.addEventListener('click', openSetup);
+  el.btnSetupCancel.addEventListener('click', () => {
+    if (!game.resumeState) return;
+    game.state = game.resumeState; game.resumeState = null;
+    hideOverlay(el.overlaySetup);
+    if (game.state === 'rolling') Sound.rollStart();
+    try { canvas.focus({ preventScroll: true }); } catch (e) { /* opcional */ }
+  });
+  el.btnChange.addEventListener('click', () => { game.state = 'setup'; el.btnSetupCancel.hidden = true; hideOverlay(el.overlayOver); showOverlay(el.overlaySetup); });
   el.btnAgain.addEventListener('click', () => { Sound.unlock(); startGame(game.players.map((p) => p.name)); });
 
   function renderPlayerInputs() {
@@ -1627,7 +1785,7 @@ const Sound = (function () {
 
     if (game.state === 'aim') {
       const kv = (game.keys.has('ArrowLeft') ? -1 : 0) + (game.keys.has('ArrowRight') ? 1 : 0);
-      if (kv) game.aimX = clamp(game.aimX + kv * 0.55 * dt, -LANE.halfWidth + BALL.radius * 0.6, LANE.halfWidth - BALL.radius * 0.6);
+      if (kv) game.aimX = clamp(game.aimX + kv * (game.keys.has('Shift') ? 1.6 : 0.45) * dt, -LANE.halfWidth + BALL.radius * 0.6, LANE.halfWidth - BALL.radius * 0.6);
       if (game.power.active) {
         game.power.t += dt;
         const ph = (game.power.t / 1.5) % 1;        // onda triangular 0→1→0
@@ -1642,7 +1800,7 @@ const Sound = (function () {
       const w = game.world;
       P.step(w, dt * scale * (game.fast ? 6 : 1), onWorldEvents);
       const b = w.ball;
-      Sound.rollUpdate(b.inPit || b.stopped ? 0 : Math.hypot(b.vx, b.vy), b.inGutter);
+      Sound.rollUpdate(b.inPit || b.stopped ? 0 : Math.hypot(b.vx, b.vy), b.inGutter, b.x / LANE.halfWidth);
       // cámara: sigue la bola, sin pasar de la zona de pinos
       const target = clamp(b.y - CAM.back, -CAM.back, CAM.maxY);
       cam.y += (target - cam.y) * Math.min(1, 7 * dt);
@@ -1654,7 +1812,7 @@ const Sound = (function () {
       if (game.timer <= 0) startSweep();
     } else if (game.state === 'sweep') {
       const sw = game.sweep;
-      sw.t += dt;
+      sw.t += dt * (game.skip ? 4 : 1);
       const t = sw.t / sw.duration;
       const w = game.world;
       // La barra recorre la zona de pinos de delante hacia atrás; los pinos desaparecen al pasar
@@ -1704,9 +1862,18 @@ const Sound = (function () {
     bg.addColorStop(0, '#05070d'); bg.addColorStop(Math.max(0.01, hz / H), '#121a2c'); bg.addColorStop(1, '#0a0d16');
     ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
 
-    // Suelo lateral (más allá de los canales)
+    // Suelo lateral (más allá de los canales) y pistas vecinas atenuadas
     const farY = LANE.endY;
-    quad(project(-kb - 3, nearY, 0), project(kb + 3, nearY, 0), project(kb + 3, farY, 0), project(-kb - 3, farY, 0), '#1b2130');
+    quad(project(-kb - 6, nearY, 0), project(kb + 6, nearY, 0), project(kb + 6, farY, 0), project(-kb - 6, farY, 0), '#171c2a');
+    const pitch = 2 * kb + 0.5;   // distancia entre centros de pistas vecinas
+    for (const sgn of [-1, 1]) {
+      const cx = sgn * pitch;
+      const ya = Math.max(nearY, 0);
+      quad(project(cx - hw, ya, 0), project(cx + hw, ya, 0), project(cx + hw, LANE.pitY, 0), project(cx - hw, LANE.pitY, 0), '#5b4630');
+      quad(project(cx - hw - LANE.gutter, ya, 0), project(cx - hw, ya, 0), project(cx - hw, LANE.pitY, 0), project(cx - hw - LANE.gutter, LANE.pitY, 0), '#1d2230');
+      quad(project(cx + hw, ya, 0), project(cx + hw + LANE.gutter, ya, 0), project(cx + hw + LANE.gutter, LANE.pitY, 0), project(cx + hw, LANE.pitY, 0), '#1d2230');
+      if (nearY < 0) quad(project(cx - hw - LANE.gutter, nearY, 0), project(cx + hw + LANE.gutter, nearY, 0), project(cx + hw + LANE.gutter, 0, 0), project(cx - hw - LANE.gutter, 0, 0), '#4f4030');
+    }
 
     // Zona de aproximación (madera más clara, con tablas) hasta la línea de falta
     if (nearY < 0) {
@@ -1743,6 +1910,18 @@ const Sound = (function () {
     const wallBase = project(0, farY, 0), wallTop = project(0, farY, 1.3);
     ctx.fillStyle = '#141b2b';
     ctx.fillRect(0, Math.min(wallTop.y, hz - 2) - 2, W, Math.max(0, wallBase.y - Math.min(wallTop.y, hz - 2) + 2));
+    // Rótulo del fondo
+    const sign = project(0, farY, 1.12);
+    if (sign.s > 20) {
+      ctx.save();
+      ctx.font = `700 ${Math.max(8, sign.s * 0.16)}px system-ui, sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.letterSpacing = '0.2em';
+      ctx.fillStyle = 'rgba(245,185,66,0.75)';
+      ctx.shadowColor = 'rgba(245,185,66,0.9)'; ctx.shadowBlur = Math.max(2, sign.s * 0.02);
+      ctx.fillText('BOWLING', sign.x, sign.y);
+      ctx.restore();
+    }
     // Franja luminosa (masking unit)
     const stripTop = project(0, farY, 0.95), stripBot = project(0, farY, 0.75);
     const g2 = ctx.createLinearGradient(0, stripTop.y, 0, stripBot.y);
@@ -1813,6 +1992,7 @@ const Sound = (function () {
     if (tilt < 0.999 || dropZ > 0) drawShadow(p.x + p.fallDir.x * h * 0.45 * tilt, p.y + p.fallDir.y * h * 0.45 * tilt, PIN.radius * (1 + tilt * 2.2), PIN.radius * 0.9, 0.28);
     ctx.translate(base.x, base.y);
     ctx.rotate(Math.atan2(dx, -dy));
+    if (p.wobbleT != null && p.wobbleT < 1.4 && tilt === 0) ctx.rotate(Math.sin(p.wobbleT * 28) * 0.09 * Math.exp(-3 * p.wobbleT));
     pinPath(w, L);
     const grad = ctx.createLinearGradient(-w / 2, 0, w / 2, 0);
     grad.addColorStop(0, '#b9bcc6'); grad.addColorStop(0.35, '#ffffff'); grad.addColorStop(0.7, '#f1f2f5'); grad.addColorStop(1, '#9ea3b1');
@@ -1885,7 +2065,8 @@ const Sound = (function () {
       const sp = Math.hypot(vx, vy); if (sp < 0.1) break;
       const prof = P.hookProfile(py);
       const ns = Math.max(0, sp - (SIM.ballDecel + (SIM.ballDecelDry - SIM.ballDecel) * prof) * dt) / sp; vx *= ns; vy *= ns;
-      const dv = SIM.hookAccel * spin * prof * dt;
+      const k = Math.min(1, (sp / SIM.hookSpeedRef) * (sp / SIM.hookSpeedRef));
+      const dv = SIM.hookAccel * spin * prof * k * dt;
       if (hooked + Math.abs(dv) <= reserve) { vx += dv; hooked += Math.abs(dv); }
       px += vx * dt; py += vy * dt;
       if (Math.abs(px) > LANE.halfWidth + BALL.radius * 0.35) { pts.push({ x: px, y: py, gutter: true }); break; }
@@ -1947,13 +2128,15 @@ const Sound = (function () {
   }
   document.addEventListener('visibilitychange', () => {
     paused = document.hidden;
-    if (paused) Sound.rollStop(); else last = performance.now();
+    if (paused) Sound.rollStop(); else { last = performance.now(); Sound.resumeIfNeeded(); }
   });
 
   // ------------------------------------------------------------ arranque
   resize();
   applySound();
   setSpin(0);
+  syncInert();
+  focusIn(el.overlaySetup);
   game.world = P.createWorld(1);
   requestAnimationFrame(frame);
 
@@ -1966,7 +2149,8 @@ const Sound = (function () {
     applyRoll(n) {
       if (game.state !== 'aim') return false;
       const standing = game.world.pins.filter((p) => p.state === 'standing');
-      if (n > standing.length) return false;
+      if (!Number.isInteger(n) || n < 0 || n > standing.length) return false;
+      if (!S.isValidRoll(game.players[game.current].rolls, n)) return false;
       game.world.ball.active = true; game.world.ball.inPit = true;
       standing.slice(0, n).forEach((p) => { p.state = 'fallen'; p.tilt = 1; p.fallDir = { x: 0, y: 1 }; });
       game.world.finished = true;
@@ -1974,6 +2158,9 @@ const Sound = (function () {
       return true;
     },
     setFast(v) { game.fast = !!v; },
+    setSeed(n) { game.seed = (n >>> 0) || 1; game.seedOverride = game.seed; },
+    skip() { return skipAhead(); },
+    lastThrow() { return game.lastThrow ? Object.assign({}, game.lastThrow) : null; },
     step(seconds) { const n = Math.ceil(seconds / (1 / 60)); for (let i = 0; i < n; i++) update(1 / 60); render(); },
     state() {
       return {
