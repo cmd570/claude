@@ -96,7 +96,7 @@
   .sb-rolls span:first-child { border-left: 0; }
   .sb-rolls span.x { color: var(--accent); font-weight: 700; }
   .sb-rolls span.sp { color: var(--accent-2); font-weight: 700; }
-  .sb-total { text-align: center; font-weight: 700; font-size: .8rem; line-height: 1.3rem; font-variant-numeric: tabular-nums; }
+  .sb-total { text-align: center; font-weight: 700; font-size: .8rem; line-height: 1.3rem; min-height: 1.3rem; font-variant-numeric: tabular-nums; }
   .sb-sum { text-align: center; font-weight: 800; font-size: .9rem; color: var(--accent); font-variant-numeric: tabular-nums; }
 
   /* ---------- Escenario ---------- */
@@ -191,14 +191,18 @@
     #scoreboard { padding: .15rem .5rem; }
     table.sb { font-size: .62rem; }
     .sb-rolls span { line-height: 1rem; height: 1rem; font-size: .6rem; }
-    .sb-total { line-height: 1rem; font-size: .66rem; }
+    .sb-total { line-height: 1rem; min-height: 1rem; font-size: .66rem; }
     .sb-head { padding: 0; }
     #hint { display: none; }
     .hud { padding: .3rem .5rem; }
   }
   [hidden] { display: none !important; }
+  @keyframes pop-still {
+    0%, 80% { opacity: 1; transform: translate(-50%, -50%); }
+    100% { opacity: 0; transform: translate(-50%, -50%); }
+  }
   @media (prefers-reduced-motion: reduce) {
-    #message.show { animation-duration: .01s; opacity: 1; transform: translate(-50%, -50%); }
+    #message.show { animation: pop-still 1.6s linear forwards; }
     .btn { transition: none; }
   }
 </style>
@@ -239,6 +243,7 @@
 
     <div id="message" aria-hidden="true"></div>
     <div id="live" class="sr-only" aria-live="polite" role="status"></div>
+    <div id="live-turn" class="sr-only" aria-live="polite"></div>
 
     <!-- Configuración de la partida -->
     <div class="overlay open" id="overlay-setup" role="dialog" aria-modal="true" aria-labelledby="setup-title">
@@ -1112,7 +1117,7 @@ const Sound = (function () {
     status: $('status'), pinsChip: $('pins-chip'), hint: $('hint'),
     spinLabel: $('spin-label'), spinFill: $('spin-fill'), spinLeft: $('spin-left'), spinRight: $('spin-right'),
     power: $('power'), powerFill: $('power-fill'),
-    message: $('message'), live: $('live'), scoreboard: $('scoreboard'),
+    message: $('message'), live: $('live'), liveTurn: $('live-turn'), scoreboard: $('scoreboard'),
     overlaySetup: $('overlay-setup'), overlayHelp: $('overlay-help'), overlayOver: $('overlay-over'),
     setupForm: $('setup-form'), playerCount: $('player-count'), playersList: $('players-list'),
     finalTable: $('final-table'), bestLine: $('best-line'),
@@ -1213,6 +1218,7 @@ const Sound = (function () {
     el.pinsChip.innerHTML = 'Bolos en pie: ';
     const c = document.createElement('b'); c.textContent = String(standing);
     el.pinsChip.appendChild(c);
+    if (!justThrown) el.liveTurn.textContent = `Turno de ${p.name}, cuadro ${n.frame + 1}, tiro ${n.roll + 1}, ${standing} bolos en pie.`;
   }
   function setSpin(v) {
     game.spin = clamp(Math.round(v * 4) / 4, -1, 1);
@@ -1518,14 +1524,18 @@ const Sound = (function () {
     });
     const prev = store.get('bowling.best', null);
     const winner = rows.find((r) => r.score === best);
-    let line;
-    if (!prev || best > prev.score) {
+    const validPrev = prev && typeof prev === 'object' && Number.isFinite(prev.score);
+    el.bestLine.textContent = '';
+    const strong = document.createElement('b');
+    if (!validPrev || best > prev.score) {
       store.set('bowling.best', { score: best, name: winner.name, date: new Date().toISOString().slice(0, 10) });
-      line = best === 300 ? '¡PARTIDA PERFECTA! Nuevo récord: <b>300</b>' : `¡Nuevo récord personal: <b>${best}</b>!`;
+      strong.textContent = String(best);
+      if (best === 300) { el.bestLine.append('¡PARTIDA PERFECTA! Nuevo récord: ', strong); }
+      else { el.bestLine.append('¡Nuevo récord personal: ', strong, '!'); }
     } else {
-      line = `Récord en este dispositivo: <b>${prev.score}</b> (${prev.name})`;
+      strong.textContent = String(prev.score);
+      el.bestLine.append('Récord en este dispositivo: ', strong, ` (${String(prev.name || '').slice(0, 14)})`);
     }
-    el.bestLine.innerHTML = line;
     showOverlay(el.overlayOver);
     el.live.textContent = 'Fin de la partida. ' + rows.map((r) => `${r.name}: ${r.score}`).join(', ');
     Sound.rollStop();
@@ -1657,6 +1667,9 @@ const Sound = (function () {
     }
     if (k === '?' ) { openHelp(); return; }
     if (anyOverlayOpen()) return;
+    // Espacio/Enter sobre un botón enfocado deben activar ese botón, no el medidor
+    const ae = document.activeElement;
+    if ((k === ' ' || k === 'Enter') && ae && ae !== canvas && ae !== document.body) return;
     if (game.state !== 'aim') {
       if ((k === ' ' || k === 'Enter') && !e.repeat) { e.preventDefault(); skipAhead(); }
       return;
@@ -1828,23 +1841,8 @@ const Sound = (function () {
   }
 
   // ------------------------------------------------------------ render
-  const BOARD_COLORS = (() => {
-    const out = [];
-    for (let i = 0; i < LANE.boards; i++) {
-      const v = 0.86 + 0.14 * ((i * 7919) % 13) / 13;
-      const r = Math.round(214 * v), g = Math.round(160 * v), b = Math.round(96 * v);
-      out.push(`rgb(${r},${g},${b})`);
-    }
-    return out;
-  })();
-  const APPROACH_COLORS = (() => {
-    const out = [];
-    for (let i = 0; i < 55; i++) {
-      const v = 0.9 + 0.1 * ((i * 104729) % 11) / 11;
-      out.push(`rgb(${Math.round(196 * v)},${Math.round(150 * v)},${Math.round(100 * v)})`);
-    }
-    return out;
-  })();
+  const BOARD_LINES = ['rgba(90,55,20,0.22)', 'rgba(90,55,20,0.14)', 'rgba(255,230,190,0.16)', 'rgba(90,55,20,0.18)', 'rgba(90,55,20,0.1)'];
+  const APPROACH_LINES = ['rgba(90,60,30,0.16)', 'rgba(255,235,200,0.12)', 'rgba(90,60,30,0.1)'];
   function quad(a, b, c, d, fill, stroke) {
     ctx.beginPath();
     ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.closePath();
@@ -1875,21 +1873,30 @@ const Sound = (function () {
       if (nearY < 0) quad(project(cx - hw - LANE.gutter, nearY, 0), project(cx + hw + LANE.gutter, nearY, 0), project(cx + hw + LANE.gutter, 0, 0), project(cx - hw - LANE.gutter, 0, 0), '#4f4030');
     }
 
-    // Zona de aproximación (madera más clara, con tablas) hasta la línea de falta
+    // Zona de aproximación (madera más clara) hasta la línea de falta, con juntas como líneas
     if (nearY < 0) {
-      const aw = (LANE.width + 2 * LANE.gutter) / 55;
-      for (let i = 0; i < 55; i++) {
-        const xa = -hw - LANE.gutter + i * aw;
-        quad(project(xa, nearY, 0), project(xa + aw, nearY, 0), project(xa + aw, 0, 0), project(xa, 0, 0), APPROACH_COLORS[i]);
+      const xl = -hw - LANE.gutter, xr = hw + LANE.gutter;
+      quad(project(xl, nearY, 0), project(xr, nearY, 0), project(xr, 0, 0), project(xl, 0, 0), '#bf9264');
+      const aw = (xr - xl) / 55;
+      ctx.lineWidth = 1;
+      for (let i = 1; i < 55; i++) {
+        const x = xl + i * aw;
+        const a = project(x, nearY, 0), b = project(x, 0, 0);
+        ctx.strokeStyle = APPROACH_LINES[i % APPROACH_LINES.length];
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
       }
     }
 
-    // Tablas de la pista (39) desde la línea de falta hasta el foso
+    // Pista: un solo relleno y las juntas de las 39 tablas como líneas (barato de dibujar)
     const y0 = Math.max(nearY, 0), y1 = LANE.pitY;
     const bw = LANE.width / LANE.boards;
-    for (let i = 0; i < LANE.boards; i++) {
-      const xa = -hw + i * bw, xb = xa + bw;
-      quad(project(xa, y0, 0), project(xb, y0, 0), project(xb, y1, 0), project(xa, y1, 0), BOARD_COLORS[i]);
+    quad(project(-hw, y0, 0), project(hw, y0, 0), project(hw, y1, 0), project(-hw, y1, 0), '#d2a06a');
+    ctx.lineWidth = 1;
+    for (let i = 1; i < LANE.boards; i++) {
+      const x = -hw + i * bw;
+      const a = project(x, y0, 0), b = project(x, y1, 0);
+      ctx.strokeStyle = BOARD_LINES[i % BOARD_LINES.length];
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
     // Brillo del aceite y oscurecimiento con la distancia
     const laneNear = project(0, y0, 0), laneFar = project(0, y1, 0);
@@ -1910,15 +1917,19 @@ const Sound = (function () {
     const wallBase = project(0, farY, 0), wallTop = project(0, farY, 1.3);
     ctx.fillStyle = '#141b2b';
     ctx.fillRect(0, Math.min(wallTop.y, hz - 2) - 2, W, Math.max(0, wallBase.y - Math.min(wallTop.y, hz - 2) + 2));
-    // Rótulo del fondo
+    // Rótulo del fondo (brillo barato: dos capas de texto, sin desenfoque)
     const sign = project(0, farY, 1.12);
     if (sign.s > 20) {
       ctx.save();
-      ctx.font = `700 ${Math.max(8, sign.s * 0.16)}px system-ui, sans-serif`;
+      const size = Math.max(8, sign.s * 0.16);
+      ctx.font = `700 ${size}px system-ui, sans-serif`;
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.letterSpacing = '0.2em';
-      ctx.fillStyle = 'rgba(245,185,66,0.75)';
-      ctx.shadowColor = 'rgba(245,185,66,0.9)'; ctx.shadowBlur = Math.max(2, sign.s * 0.02);
+      if ('letterSpacing' in ctx) ctx.letterSpacing = '0.2em';
+      ctx.fillStyle = 'rgba(245,185,66,0.22)';
+      ctx.font = `700 ${size * 1.08}px system-ui, sans-serif`;
+      ctx.fillText('BOWLING', sign.x, sign.y);
+      ctx.font = `700 ${size}px system-ui, sans-serif`;
+      ctx.fillStyle = 'rgba(245,185,66,0.8)';
       ctx.fillText('BOWLING', sign.x, sign.y);
       ctx.restore();
     }

@@ -218,3 +218,40 @@ test('R repite el último tiro con los mismos parámetros', { skip: !chromium &&
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Espacio/Enter sobre un botón enfocado activan el botón, no el medidor', { skip: !chromium && 'Playwright no disponible' }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const { page, errors } = await open(browser);
+    await page.evaluate(() => { window.__bowling.start(['Ana']); });
+    await page.waitForFunction(() => window.__bowling.state().state === 'aim');
+    await page.focus('#btn-help');
+    await page.keyboard.press('Enter');
+    assert.equal(await page.isVisible('#overlay-help'), true, 'Enter abre la ayuda');
+    assert.equal(await page.evaluate(() => window.__bowling.game.power.active), false, 'el medidor no arranca');
+    await page.keyboard.press('Escape');
+    await page.focus('#spin-right');
+    await page.keyboard.press('Space');
+    assert.equal(await page.evaluate(() => window.__bowling.state().spin), 0.25, 'Espacio pulsa el botón de efecto');
+    assert.equal(await page.evaluate(() => window.__bowling.game.power.active), false);
+    await page.focus('#game');
+    await page.keyboard.press('Space');
+    assert.equal(await page.evaluate(() => window.__bowling.game.power.active), true, 'con el lienzo enfocado sí arranca el medidor');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('con prefers-reduced-motion el mensaje del resultado sigue siendo visible', { skip: !chromium && 'Playwright no disponible' }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const { page, errors } = await open(browser, { reducedMotion: 'reduce' });
+    await page.evaluate(() => { window.__bowling.start(['Ana']); });
+    await page.waitForFunction(() => window.__bowling.state().state === 'aim');
+    await page.evaluate(() => window.__bowling.applyRoll(10));
+    await page.waitForTimeout(300);
+    const info = await page.evaluate(() => { const m = document.getElementById('message'); return { text: m.textContent, opacity: getComputedStyle(m).opacity }; });
+    assert.match(info.text, /STRIKE/);
+    assert.equal(info.opacity, '1');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
