@@ -18,7 +18,7 @@ async function open(browser, opts) {
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-  page.on('console', (m) => { if (m.type() === 'error') errors.push('console: ' + m.text()); });
+  page.on('console', (m) => { if (m.type() === 'error' || /WebGL no disponible/.test(m.text())) errors.push('console: ' + m.text()); });
   await page.goto(URL);
   await page.waitForFunction(() => !!window.__bowling);
   return { ctx, page, errors };
@@ -77,7 +77,7 @@ test('dos jugadores alternan por cuadro y el 10º cuadro da tiros extra', { skip
     await playRolls(page, [7]);
     let st = await page.evaluate(() => window.__bowling.state());
     assert.equal(st.current, 0, 'Ana sigue tras el primer tiro');
-    assert.deepEqual(st.standing.length, 3, 'quedan 3 pinos para el segundo tiro');
+    assert.deepEqual(st.standing.length, 3, 'quedan 3 bolos para el segundo tiro');
     await playRolls(page, [2]);
     st = await page.evaluate(() => window.__bowling.state());
     assert.equal(st.current, 1, 'turno de Luis');
@@ -106,7 +106,7 @@ test('dos jugadores alternan por cuadro y el 10º cuadro da tiros extra', { skip
   } finally { await browser.close(); }
 });
 
-test('un tiro con física real derriba pinos y actualiza el marcador', { skip: !chromium && 'Playwright no disponible' }, async () => {
+test('un tiro con física real derriba bolos y actualiza el marcador', { skip: !chromium && 'Playwright no disponible' }, async () => {
   const browser = await chromium.launch();
   try {
     const { page, errors } = await open(browser);
@@ -116,7 +116,7 @@ test('un tiro con física real derriba pinos y actualiza el marcador', { skip: !
     assert.equal(ok, true);
     await page.waitForFunction(() => window.__bowling.state().players[0].rolls.length === 1, null, { timeout: 20000 });
     const st = await page.evaluate(() => window.__bowling.state());
-    assert.ok(st.players[0].rolls[0] >= 6, `un tiro al bolsillo derriba muchos pinos (derribó ${st.players[0].rolls[0]})`);
+    assert.ok(st.players[0].rolls[0] >= 6, `un tiro al bolsillo derriba muchos bolos (derribó ${st.players[0].rolls[0]})`);
     await page.waitForFunction(() => window.__bowling.state().state === 'aim', null, { timeout: 20000 });
     const first = await page.$eval('.sb-frame[data-frame="0"] .sb-rolls span', (s) => s.textContent);
     assert.ok(first === '' || /\d|X/.test(first));
@@ -124,7 +124,7 @@ test('un tiro con física real derriba pinos y actualiza el marcador', { skip: !
   } finally { await browser.close(); }
 });
 
-test('la bola en el canal no derriba pinos', { skip: !chromium && 'Playwright no disponible' }, async () => {
+test('la bola en el canal no derriba bolos', { skip: !chromium && 'Playwright no disponible' }, async () => {
   const browser = await chromium.launch();
   try {
     const { page, errors } = await open(browser);
@@ -252,6 +252,53 @@ test('con prefers-reduced-motion el mensaje del resultado sigue siendo visible',
     const info = await page.evaluate(() => { const m = document.getElementById('message'); return { text: m.textContent, opacity: getComputedStyle(m).opacity }; });
     assert.match(info.text, /STRIKE/);
     assert.equal(info.opacity, '1');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+
+test('el renderizador WebGL está activo y dibuja la escena', { skip: !chromium && 'Playwright no disponible' }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const { page, errors } = await open(browser);
+    await page.evaluate(() => window.__bowling.start(['Ana']));
+    await page.waitForTimeout(300);
+    const r = await page.evaluate(() => {
+      const R3 = window.__bowling.renderer();
+      if (!R3) return { has: false };
+      const gl = R3.gl, g = window.__bowling.game, w = g.world;
+      // Dibuja un fotograma y lee píxeles en la misma tarea (preserveDrawingBuffer está desactivado)
+      R3.render({ pins: w.pins.map((p) => ({ p: p.p, q: p.q, state: p.state, alpha: 1 })), ball: { p: [g.aimX, window.__bowling.P.BALL.radius, 0], q: [0, 0, 0, 1], visible: true }, guide: null, sweep: null });
+      const n = 16, px = new Uint8Array(4 * n * n);
+      gl.readPixels((gl.drawingBufferWidth >> 1) - 8, (gl.drawingBufferHeight >> 2), n, n, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      let sum = 0; for (let i = 0; i < px.length; i += 4) sum += px[i] + px[i + 1] + px[i + 2];
+      return { has: true, err: gl.getError(), mean: sum / (n * n * 3) };
+    });
+    assert.equal(r.has, true, 'hay renderizador WebGL');
+    assert.equal(r.err, 0, 'sin errores de WebGL');
+    assert.ok(r.mean > 8, `la escena no está en negro (media ${r.mean.toFixed(1)})`);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('sin WebGL el juego sigue siendo jugable con la vista 2D de emergencia', { skip: !chromium && 'Playwright no disponible' }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const ctx = await browser.newContext({ viewport: { width: 420, height: 800 } });
+    const page = await ctx.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+    await page.addInitScript(() => {
+      const orig = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function (type, ...rest) { if (type === 'webgl' || type === 'webgl2') return null; return orig.call(this, type, ...rest); };
+    });
+    await page.goto(URL);
+    await page.waitForFunction(() => !!window.__bowling);
+    assert.equal(await page.evaluate(() => window.__bowling.renderer()), null);
+    await page.evaluate(() => { window.__bowling.setFast(true); window.__bowling.start(['Ana']); });
+    await page.waitForFunction(() => window.__bowling.state().state === 'aim');
+    await page.evaluate(() => window.__bowling.throwBall({ x: 0.07, power: 0.8, angle: 0 }));
+    await page.waitForFunction(() => window.__bowling.state().players[0].rolls.length === 1, null, { timeout: 20000 });
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

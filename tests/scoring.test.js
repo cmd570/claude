@@ -113,7 +113,7 @@ for (const c of CASES) {
   });
 }
 
-test('próximo tiro y pinos en pie (cuadros 1-9)', () => {
+test('próximo tiro y bolos en pie (cuadros 1-9)', () => {
   assert.deepEqual(S.analyze([]).next, { frame: 0, roll: 0, pinsStanding: 10 });
   assert.deepEqual(S.analyze([7]).next, { frame: 0, roll: 1, pinsStanding: 3 });
   assert.deepEqual(S.analyze([7, 2]).next, { frame: 1, roll: 0, pinsStanding: 10 });
@@ -121,7 +121,7 @@ test('próximo tiro y pinos en pie (cuadros 1-9)', () => {
   assert.deepEqual(S.analyze([0]).next, { frame: 0, roll: 1, pinsStanding: 10 });
 });
 
-test('próximo tiro y pinos en pie (cuadro 10)', () => {
+test('próximo tiro y bolos en pie (cuadro 10)', () => {
   const base = rep([1, 1], 9);
   assert.deepEqual(S.analyze(base).next, { frame: 9, roll: 0, pinsStanding: 10 });
   assert.deepEqual(S.analyze([...base, 10]).next, { frame: 9, roll: 1, pinsStanding: 10 });
@@ -160,7 +160,7 @@ test('etiquetas de casillas (cuadro 10)', () => {
   assert.deepEqual(S.labels(fr([10, 10])), ['X', 'X', '']);
 });
 
-test('puntaje provisional cuenta pinos derribados y bonos conocidos', () => {
+test('puntaje provisional cuenta bolos derribados y bonos conocidos', () => {
   assert.equal(S.analyze([]).provisional, 0);
   assert.equal(S.analyze([10]).provisional, 10);
   assert.equal(S.analyze([10, 5]).provisional, 20);

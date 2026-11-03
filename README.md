@@ -34,7 +34,7 @@ sin servidor y sin recursos externos: abre `index.html` en cualquier navegador m
 | Control | Acción |
 | --- | --- |
 | Toque / ratón | Toca la pista para colocar la bola, **arrastra hacia arriba y suelta** para lanzar. Más velocidad de gesto = más fuerza; la inclinación del gesto marca la dirección. |
-| `←` `→` | Mover la bola a los lados. |
+| `←` `→` | Mover la bola a los lados (con `Mayús`, más rápido). |
 | `↑` `↓` | Ajustar el ángulo del tiro. |
 | `A` `D` (o los botones ↶ ↷) | Efecto hacia la izquierda o la derecha. |
 | `Espacio` / `Enter` | Arranca el medidor de potencia; vuelve a pulsar para lanzar. Mientras rueda la bola: acelera; después: salta la recogida. |
@@ -86,4 +86,5 @@ node --test tests/scoring.test.js tests/physics.test.js
 
 En la consola del navegador, `window.__bowling` expone utilidades para pruebas
 automáticas: `start(nombres)`, `throwBall({x, power, angle, spin})`, `applyRoll(n)`
-(aplica un tiro sin física), `setFast(true)`, `setSeed(n)`, `skip()` y `state()`.
+(aplica un tiro sin física), `setFast(true)`, `setSeed(n)`, `skip()`, `state()`,
+`lastThrow()`, `renderer()` (el renderizador WebGL) y `freezeCamera(ojo, objetivo)`.
